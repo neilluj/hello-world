@@ -1,0 +1,190 @@
+# ols_diagnostics.py
+# Reusable pipeline to check OLS assumptions in statsmodels
+# Now supports both results objects AND formulas (smf.ols)
+
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+from statsmodels.stats.diagnostic import het_breuschpagan, het_white, linear_reset, normal_ad
+from statsmodels.stats.stattools import durbin_watson, jarque_bera
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+
+try:
+    from scipy.stats import shapiro
+    HAVE_SHAPIRO = True
+except Exception:
+    HAVE_SHAPIRO = False
+
+# -----------------------
+# Core helpers
+# -----------------------
+def _as_dataframe_exog(results):
+    """
+    Return exog as a pandas.DataFrame with proper column names.
+    If already a DataFrame in the model, reuse that to keep original names.
+    """
+    exog = results.model.exog
+    names = results.model.exog_names
+    if hasattr(results.model, "data") and isinstance(getattr(results.model.data, "orig_exog", None), pd.DataFrame):
+        return pd.DataFrame(results.model.data.orig_exog).copy()
+    return pd.DataFrame(exog, columns=names)
+
+def _maybe_fit(results_or_formula, data=None):
+    """
+    Accept either a fitted RegressionResults object OR (formula, data).
+    Returns a fitted results object.
+    """
+    if hasattr(results_or_formula, "fittedvalues") and hasattr(results_or_formula, "model"):
+        return results_or_formula
+    
+    formula = results_or_formula
+    if data is None:
+        raise ValueError("If passing a formula, you must also pass `data=`")
+    model = smf.ols(formula=formula, data=data).fit()
+    return model
+
+# -----------------------
+# Public API
+# -----------------------
+def vif_table(results, drop_intercept=True):
+    """
+    Compute VIF for each regressor. By default, drops the intercept column if present.
+    """
+    X = _as_dataframe_exog(results)
+    cols = list(X.columns)
+    intercept_like = {"Intercept", "const", "CONST", "intercept", "_cons"}
+    if drop_intercept:
+        cols = [c for c in cols if c not in intercept_like]
+    if len(cols) == 0:
+        return pd.DataFrame({"variable": [], "VIF": []})
+    X_use = X[cols].to_numpy()
+    vif_vals = []
+    for i in range(X_use.shape[1]):
+        vif_vals.append(variance_inflation_factor(X_use, i))
+    return pd.DataFrame({"variable": cols, "VIF": vif_vals})
+
+def residuals_vs_fitted_plot(results):
+    fitted = results.fittedvalues
+    resid = results.resid
+    plt.figure()
+    plt.scatter(fitted, resid, alpha=0.7)
+    plt.axhline(0.0, linestyle="--")
+    plt.xlabel("Fitted values")
+    plt.ylabel("Residuals")
+    plt.title("Residuals vs Fitted")
+    plt.tight_layout()
+    plt.show()
+
+def qq_plot(results):
+    plt.figure()
+    sm.qqplot(results.resid, line="s")
+    plt.title("QQ-plot of residuals")
+    plt.tight_layout()
+    plt.show()
+
+def heteroskedasticity_tests(results):
+    resid = results.resid
+    exog = results.model.exog
+    lm, lm_pvalue, fstat, f_pvalue = het_breuschpagan(resid, exog)
+    w_lm, w_lm_p, w_f, w_f_p = het_white(resid, exog)
+    return {
+        "breusch_pagan_LM": lm,
+        "breusch_pagan_pvalue": lm_pvalue,
+        "breusch_pagan_F": fstat,
+        "breusch_pagan_F_pvalue": f_pvalue,
+        "white_LM": w_lm,
+        "white_pvalue": w_lm_p,
+        "white_F": w_f,
+        "white_F_pvalue": w_f_p,
+    }
+
+def reset_test(results, power=2, use_f=True):
+    test = linear_reset(results, power=power, use_f=use_f)
+    out = {}
+    for attr in ["fvalue", "f_pvalue", "tvalue", "t_pvalue"]:
+        if hasattr(test, attr):
+            out[attr] = getattr(test, attr)
+    return out
+
+def normality_tests(results, use_shapiro=True):
+    resid = results.resid
+    jb_stat, jb_pvalue, skew, kurtosis = jarque_bera(resid)
+    out = {
+        "jarque_bera": jb_stat,
+        "jarque_bera_pvalue": jb_pvalue,
+        "skew": skew,
+        "kurtosis_excess": kurtosis,
+    }
+    try:
+        ad_stat, ad_pvalue = normal_ad(resid)
+        out.update({"anderson_darling": ad_stat, "anderson_darling_pvalue": ad_pvalue})
+    except Exception:
+        pass
+    if use_shapiro and HAVE_SHAPIRO and len(resid) <= 5000:
+        try:
+            sh_stat, sh_pvalue = shapiro(resid)
+            out.update({"shapiro": sh_stat, "shapiro_pvalue": sh_pvalue})
+        except Exception:
+            pass
+    return out
+
+def independence_test(results):
+    return {"durbin_watson": durbin_watson(results.resid)}
+
+def diagnostics_summary(results_or_formula, data=None, drop_intercept_in_vif=True, reset_power=2, use_f=True, include_plots=True):
+    """
+    Produce diagnostics given either a fitted results object or a (formula, data) pair.
+    """
+    results = _maybe_fit(results_or_formula, data=data)
+
+    if include_plots:
+        residuals_vs_fitted_plot(results)
+        qq_plot(results)
+
+    het = heteroskedasticity_tests(results)
+    rst = reset_test(results, power=reset_power, use_f=use_f)
+    nrm = normality_tests(results, use_shapiro=True)
+    ind = independence_test(results)
+    try:
+        vif = vif_table(results, drop_intercept=drop_intercept_in_vif)
+    except Exception as e:
+        warnings.warn(f"VIF computation failed: {e}")
+        vif = pd.DataFrame(columns=["variable", "VIF"])
+
+    flat = {}
+    flat.update(het)
+    flat.update(rst)
+    flat.update(nrm)
+    flat.update(ind)
+    diag_df = pd.DataFrame([flat])
+    return diag_df, vif
+
+def fit_and_diagnostics(formula, data, drop_intercept_in_vif=True, reset_power=2, use_f=True, include_plots=True):
+    results = smf.ols(formula=formula, data=data).fit()
+    diag, vif = diagnostics_summary(results, drop_intercept_in_vif=drop_intercept_in_vif,
+                                    reset_power=reset_power, use_f=use_f, include_plots=include_plots)
+    return results, diag, vif
+
+# -----------------------
+# Minimal usage example
+# -----------------------
+if __name__ == "__main__":
+    rng = np.random.default_rng(0)
+    n = 300
+    X1 = rng.normal(size=n)
+    X2 = 0.7*X1 + rng.normal(scale=0.5, size=n)
+    eps = rng.normal(scale=1.0, size=n)
+    y = 1.0 + 2.5*X1 - 1.5*X2 + eps
+
+    df = pd.DataFrame({"y": y, "X1": X1, "X2": X2})
+
+    results, diag_df, vif_df = fit_and_diagnostics("y ~ X1 + X2", df, include_plots=True)
+    print(results.summary())
+    print("\n=== Diagnostics ===")
+    print(diag_df.round(4).T)
+    print("\n=== VIF ===")
+    print(vif_df.round(4))
