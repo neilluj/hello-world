@@ -1,0 +1,24 @@
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+# Ejemplo de DataFrame con muchas variables
+import numpy as np
+np.random.seed(0)
+df = pd.DataFrame(np.random.randn(100, 12), columns=[f"Var{i}" for i in range(1, 13)])
+
+# 1. Calcular la matriz de correlación
+corr = df.corr()
+
+# 2. Graficar con seaborn
+plt.figure(figsize=(12, 8))  # tamaño más grande para que se lea bien
+sns.heatmap(
+    corr,
+    cmap="coolwarm",      # paleta de colores
+    annot=False,          # quitar los números para no saturar
+    fmt=".2f",
+    linewidths=0.5,       # líneas entre cuadros
+    cbar_kws={"shrink": .8}  # barra de color más compacta
+)
+plt.title("Matriz de correlación", fontsize=16, weight="bold")
+plt.show()
