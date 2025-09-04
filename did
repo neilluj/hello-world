@@ -202,3 +202,19 @@ def did_event_study_twfe(
             "never_treated_as_controls": drop_never_treated_dummies
         }
     }
+
+out = did_event_study_twfe(
+    df=mi_df,
+    id_col="estado_mpio",         # o "id"
+    time_col="mes",               # datetime64, period, int AAAAMM o str
+    outcome_col="y",              # variable dependiente
+    treat_start_col="mes_inicio", # fecha de inicio por unidad (NaT/NaN si nunca tratado)
+    controls=["x1","x2"],         # opcional
+    k_pre=6, k_post=12, base_k=-1,
+    cluster="two-way",            # "entity", "time", "two-way" o None
+    add_time_fe=True,
+    figure=True
+)
+
+print(out["result"].summary)   # tabla de resultados
+out["betas"].head()            # coeficientes del evento-estudio
