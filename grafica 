@@ -1,0 +1,17 @@
+from plotly.subplots import make_subplots
+
+estados = df["estado"].unique()
+fig = make_subplots(rows=len(estados), cols=1, shared_xaxes=True,
+                    subplot_titles=estados)
+
+for i, estado in enumerate(estados, start=1):
+    df_estado = df[df["estado"] == estado]
+    for municipio, df_mpio in df_estado.groupby("municipio"):
+        fig.add_trace(
+            go.Scatter(x=df_mpio["mes"], y=df_mpio["valor"], 
+                       mode="lines+markers", name=f"{estado} - {municipio}"),
+            row=i, col=1
+        )
+
+fig.update_layout(height=300*len(estados), showlegend=False, template="plotly_white")
+fig.show()
