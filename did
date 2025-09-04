@@ -1,0 +1,204 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from typing import Optional, List, Tuple, Union, Dict
+from linearmodels.panel import PanelOLS
+import statsmodels.api as sm
+
+def _to_months(series: pd.Series) -> pd.Series:
+    """
+    Convierte fechas (datetime/period/int AAAAMM/str) a (year, month) numéricos.
+    Devuelve AAAAMM como entero para facilitar restas en meses.
+    """
+    s = series.copy()
+    # datetime or period
+    if np.issubdtype(s.dtype, np.datetime64):
+        return s.dt.year * 100 + s.dt.month
+    if isinstance(s.dtype, pd.PeriodDtype):
+        return s.dt.year * 100 + s.dt.month
+    # int AAAAMM
+    if np.issubdtype(s.dtype, np.integer):
+        return s
+    # str a int AAAAMM si parece 'AAAAMM' o 'AAAA-MM...'
+    s = s.astype(str).str.replace(r'[^0-9]', '', regex=True)
+    return s.astype(int)
+
+def _months_diff(yyyymm_a: pd.Series, yyyymm_b: pd.Series) -> pd.Series:
+    """
+    Diferencia en meses entre AAAAMM (a - b).
+    """
+    ay, am = (yyyymm_a // 100), (yyyymm_a % 100)
+    by, bm = (yyyymm_b // 100), (yyyymm_b % 100)
+    return (ay - by) * 12 + (am - bm)
+
+def did_event_study_twfe(
+    df: pd.DataFrame,
+    id_col: str,
+    time_col: str,
+    outcome_col: str,
+    treat_start_col: str,
+    controls: Optional[List[str]] = None,
+    k_pre: int = 6,
+    k_post: int = 12,
+    base_k: int = -1,
+    drop_never_treated_dummies: bool = True,
+    cluster: Union[str, Tuple[bool, bool], None] = "entity",  # "entity", "time", "two-way", None, o (cluster_entity, cluster_time)
+    add_time_fe: bool = True,
+    figure: bool = True,
+    title: str = "Evento-estudio (TWFE, adopción escalonada)",
+) -> Dict[str, object]:
+    """
+    Estima un evento-estudio DiD (TWFE) con adopción escalonada.
+    - Centra el tiempo relativo al inicio del tratamiento por unidad.
+    - Incluye FE de unidad (siempre) y FE de tiempo (opcional).
+    - Agrupa errores por unidad/tiempo/doble, según 'cluster'.
+
+    Parámetros principales:
+      df: DataFrame panel.
+      id_col, time_col, outcome_col, treat_start_col: nombres de columnas.
+      controls: lista de covariables exógenas opcionales X_{it}.
+      k_pre, k_post: ventana de leads/lags; colapsa colas a [-k_pre, k_post].
+      base_k: periodo omitido (típicamente -1).
+      drop_never_treated_dummies: si True, fuerza 0 en dummies de evento para nunca tratados.
+      cluster:
+        - "entity" -> cluster por unidad
+        - "time" -> cluster por tiempo
+        - "two-way" -> doble cluster (unidad y tiempo)
+        - None -> robust (HC)
+        - (bool,bool) -> (cluster_entity, cluster_time) de PanelOLS
+      add_time_fe: si True, añade FE de tiempo (dummies para cada fecha).
+      figure: si True, grafica betas con IC 95%.
+    """
+    if controls is None:
+        controls = []
+
+    data = df.copy()
+    # Tipos
+    yyyymm_time = _to_months(data[time_col])
+    yyyymm_start = data[treat_start_col].copy()
+
+    # Convertir treat_start a AAAAMM (permite NaT/NaN = nunca tratado)
+    if pd.api.types.is_datetime64_any_dtype(yyyymm_start):
+        yyyymm_start = _to_months(yyyymm_start)
+    else:
+        # Permitir objetos/strings/int; NaN/NaT tratados como nunca
+        # Si ya es entero (AAAAMM) o string convertible, funciona _to_months
+        try:
+            yyyymm_start = _to_months(pd.to_datetime(yyyymm_start))
+        except Exception:
+            # Si falla la conversión directa, intentamos como str/int mixto
+            yyyymm_start = _to_months(yyyymm_start)
+
+    never_treated = yyyymm_start.isna()
+    data['_NEVER_'] = never_treated
+
+    # Event time en meses (NaN para nunca tratados)
+    event_time = pd.Series(np.nan, index=data.index, dtype='float')
+    evt_mask = ~never_treated
+    event_time.loc[evt_mask] = _months_diff(yyyymm_time[evt_mask], yyyymm_start[evt_mask])
+
+    # Binning de colas
+    event_time_b = event_time.copy()
+    event_time_b.loc[event_time_b < -k_pre] = -k_pre
+    event_time_b.loc[event_time_b >  k_post] =  k_post
+
+    # Dummies de evento
+    d_ev = pd.get_dummies(event_time_b, prefix='ev', dummy_na=False)
+    base_col = f'ev_{int(base_k)}'
+    if base_col in d_ev.columns:
+        d_ev = d_ev.drop(columns=[base_col])  # periodo base
+
+    if drop_never_treated_dummies:
+        d_ev = d_ev.where(~never_treated, 0)
+
+    # FE de tiempo (opcional)
+    X_blocks = [d_ev]
+    if add_time_fe:
+        d_t = pd.get_dummies(yyyymm_time, prefix='t')
+        X_blocks.append(d_t)
+
+    # Controles
+    if controls:
+        X_blocks.append(data[controls])
+
+    X = pd.concat(X_blocks, axis=1)
+
+    # Índice panel
+    panel = data.set_index([id_col, time_col]).sort_index()
+    X = X.set_index(panel.index)
+    y = panel[outcome_col]
+
+    # Ajuste TWFE con efectos de unidad
+    model = PanelOLS(y, sm.add_constant(X), entity_effects=True)
+
+    # Especificación de var-cov
+    cov_kw = {}
+    cov_type = 'clustered'
+    cluster_entity = cluster_time = False
+    if cluster in ("entity", "time", "two-way"):
+        if cluster == "entity":
+            cluster_entity, cluster_time = True, False
+        elif cluster == "time":
+            cluster_entity, cluster_time = False, True
+        else:  # two-way
+            cluster_entity, cluster_time = True, True
+    elif isinstance(cluster, tuple) and len(cluster) == 2:
+        cluster_entity, cluster_time = bool(cluster[0]), bool(cluster[1])
+    elif cluster is None:
+        cov_type = 'robust'
+    else:
+        # por defecto, entity
+        cluster_entity = True
+
+    if cov_type == 'clustered':
+        res = model.fit(cov_type='clustered',
+                        cluster_entity=cluster_entity,
+                        cluster_time=cluster_time)
+    else:
+        res = model.fit(cov_type='robust')
+
+    # Extraer betas de evento
+    coef = res.params.filter(like='ev_')
+    se = res.std_errors.loc[coef.index]
+
+    def parse_k(name: str) -> int:
+        # nombre tipo 'ev_-3' -> -3
+        return int(name.split('_')[1])
+
+    betas = (
+        pd.DataFrame({'beta': coef, 'se': se})
+          .assign(k=lambda d: d.index.map(parse_k))
+          .sort_values('k')
+          .reset_index(drop=True)
+    )
+    betas['ci_low'] = betas['beta'] - 1.96 * betas['se']
+    betas['ci_high'] = betas['beta'] + 1.96 * betas['se']
+    betas['base_k'] = base_k
+
+    fig = None
+    if figure and len(betas):
+        fig = plt.figure(figsize=(8, 5))
+        ax = plt.gca()
+        ax.axhline(0, linestyle='--', linewidth=1)
+        ax.axvline(base_k, linestyle=':', linewidth=1)
+        ax.plot(betas['k'], betas['beta'], marker='o')
+        ax.fill_between(betas['k'], betas['ci_low'], betas['ci_high'], alpha=0.2, step='mid')
+        ax.set_title(title)
+        ax.set_xlabel('k = meses relativos (t - T_i)')
+        ax.set_ylabel(f'Efecto vs k={base_k}')
+        plt.tight_layout()
+
+    return {
+        "result": res,
+        "betas": betas,
+        "figure": fig,
+        "design_info": {
+            "k_pre": k_pre,
+            "k_post": k_post,
+            "base_k": base_k,
+            "cluster_entity": cluster_entity,
+            "cluster_time": cluster_time,
+            "add_time_fe": add_time_fe,
+            "never_treated_as_controls": drop_never_treated_dummies
+        }
+    }
