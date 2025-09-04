@@ -1,0 +1,27 @@
+import pandas as pd
+
+# Ejemplo de DataFrame
+df = pd.DataFrame({
+    "estado": ["A", "A", "A", "A", "B", "B", "B"],
+    "municipio": ["X", "X", "X", "X", "Y", "Y", "Y"],
+    "mes": pd.to_datetime([
+        "2021-01-01", "2021-02-01", "2021-03-01", "2021-04-01",
+        "2021-01-01", "2021-02-01", "2021-03-01"
+    ]),
+    "flg_tratamiento": [0, 1, 0, 1, 0, 0, 1]
+})
+
+# 1. Encontrar el primer mes donde flg_tratamiento = 1 por grupo
+primer_mes = (
+    df.loc[df["flg_tratamiento"] == 1]
+    .groupby(["estado", "municipio"])["mes"]
+    .min()
+    .reset_index()
+    .rename(columns={"mes": "primer_mes"})
+)
+
+# 2. Unirlo al df original
+df = df.merge(primer_mes, on=["estado", "municipio"], how="left")
+
+# 3. Crear índice: diferencia en meses
+df["indice"] = ((df["mes"].dt.to_period("M") - df["primer_mes"].dt.to_period("M")).apply(lambda x: x.n))
