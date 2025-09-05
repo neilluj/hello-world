@@ -1,0 +1,189 @@
+def did_csdid_att(
+    df, id_col, time_col, outcome_col, treat_start_col,
+    controls=None, pre_ref="last_pre",    # "last_pre" o "mean_pre"
+    k_pre=6, k_post=12,                   # solo para recorte de dinámicas al reportar
+    weight_scheme="cohort_size",          # pesos positivos
+    n_boot=0, seed=123                    # opcional: bootstrap por unidad
+):
+    """
+    Estima ATT(g,t) al estilo Callaway & Sant'Anna (2021) usando como control a los aún-no-tratados en cada t.
+    Implementa el DID 2x2 por (g,t) con base pre de la cohorte g (último pre o promedio de pre).
+    Agrega dinámicas por k=t-g y un ATT global con pesos positivos.
+    """
+    import numpy as np, pandas as pd
+    rng = np.random.default_rng(seed)
+
+    if controls is None: controls = []
+
+    # --- Normaliza tiempo a AAAAMM (como en tu helper) ---
+    def _to_months(series):
+        s = series.copy()
+        if pd.api.types.is_datetime64_any_dtype(s) or isinstance(s.dtype, pd.PeriodDtype):
+            return pd.to_datetime(s).dt.year*100 + pd.to_datetime(s).dt.month
+        try:
+            return pd.to_datetime(s).dt.year*100 + pd.to_datetime(s).dt.month
+        except:
+            s = s.astype(str).str.replace(r'[^0-9]','', regex=True)
+            return s.astype(int)
+
+    data = df.copy()
+    data["_t"] = _to_months(data[time_col])
+    # inicio de tratamiento g (NaN = nunca tratados)
+    g_raw = data[treat_start_col]
+    try:
+        data["_g"] = _to_months(pd.to_datetime(g_raw))
+    except:
+        data["_g"] = _to_months(g_raw)
+    never = data["_g"].isna()
+
+    # universo de tiempos
+    all_t = np.sort(data["_t"].unique())
+
+    # cohortes tratadas (excluye nunca)
+    cohorts = np.sort(data.loc[~never, "_g"].unique())
+
+    # helper: marca aún-no-tratados a t (incluye never o los que entran después de t)
+    def not_yet_treated_mask(df_t, current_t):
+        # aún no tratados si g > t o g es NaN
+        return df_t["_g"].isna() | (df_t["_g"] > current_t)
+
+    # --- función para calcular ATT(g,t) por DID 2x2 ---
+    # ATT(g,t) = [E(Y_t | G=g) - E(Y_b | G=g)] - [E(Y_t | C_t) - E(Y_b | C_b)]
+    # donde b es el periodo base para la cohorte g (last_pre = g-1; mean_pre = promedio de todos los pre de g)
+    att_list = []
+
+    # pre-cálculos por (unidad, t) del outcome para acelerar
+    # (ya está en data; si usas controles para ajustar podrías añadir regresión previa, pero aquí usamos DID simple)
+    for g in cohorts:
+        # unidades de la cohorte g
+        idx_g = data["_g"] == g
+        ids_g = data.loc[idx_g, id_col].unique()
+        # pre-periods de la cohorte g
+        pre_ts = all_t[all_t < g]
+        if len(pre_ts) == 0:
+            # si no hay pre, no se puede identificar ATT para esta cohorte
+            continue
+
+        # periodo base b(g)
+        if pre_ref == "last_pre":
+            b = pre_ts.max()
+            # métricas base
+            y_bg = data.loc[idx_g & (data["_t"] == b), outcome_col].mean()
+        elif pre_ref == "mean_pre":
+            # promedio sobre todos los pre de la cohorte g
+            y_bg = (data.loc[idx_g & data["_t"].isin(pre_ts), [id_col, "_t", outcome_col]]
+                        .groupby([id_col, "_t"], as_index=False).mean()[outcome_col].mean())
+        else:
+            raise ValueError("pre_ref debe ser 'last_pre' o 'mean_pre'")
+
+        # promedio base en controles "aún-no-tratados" correspondientes al/los pre
+        if pre_ref == "last_pre":
+            mask_c_b = not_yet_treated_mask(data, b) & (data["_t"] == b)
+            y_bc = data.loc[mask_c_b, outcome_col].mean()
+        else:  # mean_pre
+            mask_c_pre = not_yet_treated_mask(data, pre_ts.max()) & data["_t"].isin(pre_ts)
+            y_bc = (data.loc[mask_c_pre, [id_col, "_t", outcome_col]]
+                        .groupby([id_col, "_t"], as_index=False).mean()[outcome_col].mean())
+
+        # tamaños para pesos
+        n_g = len(ids_g)
+
+        # recorre tiempos post para esta cohorte
+        post_ts = all_t[all_t >= g]
+        for t in post_ts:
+            # tratados g en t
+            y_tg = data.loc[idx_g & (data["_t"] == t), outcome_col].mean()
+
+            # controles en t: aún no tratados a t
+            mask_ct = not_yet_treated_mask(data, t) & (data["_t"] == t)
+            y_tc = data.loc[mask_ct, outcome_col].mean()
+
+            if np.isnan(y_tg) or np.isnan(y_tc) or np.isnan(y_bg) or np.isnan(y_bc):
+                continue
+
+            att_gt = (y_tg - y_bg) - (y_tc - y_bc)
+
+            att_list.append({
+                "g": int(g), "t": int(t),
+                "k": int((t // 100 - g // 100) * 12 + (t % 100) - (g % 100)),  # meses relativos
+                "ATT_gt": att_gt, "n_g": n_g
+            })
+
+    att_gt = pd.DataFrame(att_list)
+    if att_gt.empty:
+        return {"att_gt": att_gt, "att_k": None, "att_overall": None, "boot_se": None}
+
+    # --- filtra rango de k si quieres reportar dinámicas limpias ---
+    att_gt = att_gt[(att_gt["k"] >= -k_pre) & (att_gt["k"] <= k_post)]
+
+    # --- agregaciones con pesos positivos ---
+    # pesos por tamaño de cohorte (default)
+    if weight_scheme == "cohort_size":
+        w = att_gt.groupby("g")["n_g"].transform(lambda x: x / x.iloc[0])  # constante por cohorte
+    else:
+        # todos iguales
+        w = 1.0
+    att_gt["w"] = w
+
+    # dinámicas por k (promedio ponderado por cohorte)
+    att_k = (att_gt.groupby("k")
+                  .apply(lambda d: np.average(d["ATT_gt"], weights=d["w"]))
+                  .rename("ATT_k").reset_index())
+
+    # ATT global (pondera por tamaño de cohorte)
+    # primero ATT_g (promedio sobre t para cada cohorte)
+    att_g = (att_gt.groupby("g")
+                  .apply(lambda d: d["ATT_gt"].mean())
+                  .rename("ATT_g").reset_index())
+    # pesos de cohorte (n_g / suma n_g)
+    w_g = att_gt.groupby("g")["n_g"].first()
+    w_g = w_g / w_g.sum()
+    att_overall = float(np.sum(att_g.set_index("g")["ATT_g"] * w_g))
+
+    # --- opcional: bootstrap por unidad para SE del overall y de ATT_k ---
+    boot = None
+    if n_boot and n_boot > 0:
+        ids = data[id_col].unique()
+        att_overall_b = []
+        att_k_bags = []
+
+        for _ in range(n_boot):
+            # remuestreo por unidad (block bootstrap)
+            sample_ids = rng.choice(ids, size=len(ids), replace=True)
+            sample = pd.concat([data[data[id_col] == i] for i in sample_ids], axis=0)
+
+            tmp = did_csdid_att(sample, id_col, time_col, outcome_col, treat_start_col,
+                                controls=controls, pre_ref=pre_ref, k_pre=k_pre, k_post=k_post,
+                                weight_scheme=weight_scheme, n_boot=0, seed=seed)
+            if tmp["att_overall"] is not None:
+                att_overall_b.append(tmp["att_overall"])
+            if tmp["att_k"] is not None and not tmp["att_k"].empty:
+                att_k_bags.append(tmp["att_k"].set_index("k")["ATT_k"])
+
+        boot = {}
+        if att_overall_b:
+            boot["overall_se"] = float(np.std(att_overall_b, ddof=1))
+        if att_k_bags:
+            # alinear por k y sacar sd
+            A = pd.concat(att_k_bags, axis=1)
+            boot["att_k_se"] = A.std(axis=1, ddof=1).reset_index(name="se")
+
+    return {"att_gt": att_gt.reset_index(drop=True),
+            "att_k": att_k.reset_index(drop=True) if att_k is not None else None,
+            "att_overall": att_overall,
+            "boot_se": boot}
+
+
+cs = did_csdid_att(
+    df,
+    id_col="id", time_col="mes", outcome_col="y",
+    treat_start_col="mes_inicio_trat",
+    pre_ref="last_pre",   # o "mean_pre"
+    k_pre=6, k_post=12,
+    weight_scheme="cohort_size",
+    n_boot=0
+)
+
+cs["att_gt"].head()   # tabla con ATT(g,t)
+cs["att_k"].head()    # dinámica por k = t-g (evento-estudio al estilo CS)
+cs["att_overall"]     # ATT promedio en tratados (pesos positivos)
