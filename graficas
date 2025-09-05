@@ -1,0 +1,27 @@
+import matplotlib.pyplot as plt
+
+df_att = cs["att_gt"]
+
+plt.figure(figsize=(8,6))
+for g, d in df_att.groupby("g"):
+    plt.plot(d["k"], d["ATT_gt"], marker="o", label=f"Cohorte {g}")
+
+plt.axhline(0, color="black", linestyle="--")
+plt.xlabel("k = periodos relativos al tratamiento")
+plt.ylabel("ATT(g,t)")
+plt.title("Resultados por cohorte (Callaway & Sant'Anna)")
+plt.legend()
+plt.show()
+
+
+df_dyn = cs["att_k"]
+
+plt.figure(figsize=(8,6))
+plt.plot(df_dyn["k"], df_dyn["ATT_k"], marker="o")
+plt.axhline(0, color="black", linestyle="--")
+plt.xlabel("k = periodos relativos")
+plt.ylabel("ATT promedio")
+plt.title("Dinámica promedio (Callaway & Sant'Anna)")
+plt.show()
+
+
