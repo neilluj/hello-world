@@ -1,0 +1,177 @@
+# Requisitos:
+# pip install pandas numpy shapely fiona pyproj scikit-learn
+
+import os, zipfile, re
+import numpy as np
+import pandas as pd
+import fiona
+from shapely.geometry import shape
+from pyproj import CRS, Transformer
+from sklearn.neighbors import BallTree
+
+def _ensure_str_5(x):
+    s = str(x).strip()
+    if s.endswith('.0'):
+        s = s[:-2]
+    return s.zfill(5)
+
+def _open_vector(path):
+    """
+    Abre un .shp o un .zip (que contenga el .shp) y devuelve la ruta al .shp.
+    """
+    if path.lower().endswith(".zip"):
+        extract_dir = os.path.splitext(path)[0] + "_extracted"
+        os.makedirs(extract_dir, exist_ok=True)
+        with zipfile.ZipFile(path, "r") as z:
+            z.extractall(extract_dir)
+        # busca .shp
+        shp_candidates = [os.path.join(extract_dir, f) for f in os.listdir(extract_dir) if f.lower().endswith(".shp")]
+        if not shp_candidates:
+            raise FileNotFoundError("El ZIP no contiene un .shp.")
+        return shp_candidates[0]
+    else:
+        if not path.lower().endswith(".shp"):
+            raise ValueError("Proporciona un .shp o un .zip con el .shp.")
+        return path
+
+def _detect_muni_key(fields, sample_records):
+    """
+    Intenta detectar la(s) columna(s) de clave municipal en propiedades del shapefile.
+    Retorna:
+      - ('single', 'CVEGEO') si es una sola columna
+      - ('concat', ('CVE_ENT','CVE_MUN')) si se debe concatenar EE+MMM
+    """
+    # Preferimos CVEGEO
+    for c in fields:
+        if c.upper() == "CVEGEO":
+            return ("single", c)
+
+    # Alternativa: estado + municipio
+    state_cand, muni_cand = None, None
+    for c in fields:
+        u = c.upper()
+        if u in ("CVE_ENT","CVEENT","ENTIDAD","CVE_ENTIDAD","CVE_ENTI","CVEGEO_ENT"):
+            state_cand = state_cand or c
+        if u in ("CVE_MUN","CVEMUN","MUN","MUNICIPIO","CVE_MUNICIP"):
+            muni_cand = muni_cand or c
+    if state_cand and muni_cand:
+        return ("concat", (state_cand, muni_cand))
+
+    # Último recurso: campo con muchos 5 dígitos
+    for c in fields:
+        vals = [str(r.get(c,"")).strip() for r in sample_records]
+        ratio_5d = sum(1 for v in vals if re.fullmatch(r"\d{5}", v)) / max(1,len(vals))
+        if ratio_5d > 0.6:
+            return ("single", c)
+
+    raise ValueError("No pude detectar una columna de clave municipal (CVEGEO o EE+MMM).")
+
+def _centroids_from_shapefile(shp_path):
+    """
+    Lee el shapefile y devuelve DataFrame con cve_mun, lat, lon (WGS84).
+    """
+    rows = []
+    with fiona.open(shp_path, "r") as src:
+        # Detecta CRS
+        crs_wkt = src.crs_wkt
+        crs = CRS.from_wkt(crs_wkt) if crs_wkt else (CRS.from_user_input(src.crs) if src.crs else None)
+        # Pre-lee algunos registros para heurísticas
+        fields = list(src.schema["properties"].keys())
+        sample_props = []
+        for i, feat in enumerate(src):
+            sample_props.append(feat["properties"])
+            if i >= 199:
+                break
+        # Reinicia iterator
+        src.close()
+    with fiona.open(shp_path, "r") as src:
+        mode, keyinfo = _detect_muni_key(fields, sample_props)
+        # Transformador a WGS84 si hace falta
+        if crs and not crs.equals(CRS.from_epsg(4326)):
+            to_wgs84 = Transformer.from_crs(crs, CRS.from_epsg(4326), always_xy=True)
+        else:
+            to_wgs84 = None
+
+        for feat in src:
+            props = feat["properties"]
+            geom = shape(feat["geometry"]) if feat["geometry"] else None
+            if geom is None:
+                continue
+            cx, cy = geom.centroid.x, geom.centroid.y
+            if to_wgs84 is not None:
+                # ojo: always_xy=True => x=lon, y=lat
+                cx, cy = to_wgs84.transform(cx, cy)
+
+            if mode == "single":
+                cve = str(props[keyinfo]).strip()[:5]
+                cve = _ensure_str_5(cve)
+            else:
+                ce, cm = keyinfo
+                cve = _ensure_str_5(str(props[ce]).zfill(2) + str(props[cm]).zfill(3))
+
+            rows.append({"cve_mun": cve, "lat": cy, "lon": cx})
+
+    df_cent = pd.DataFrame(rows).drop_duplicates(subset=["cve_mun"]).reset_index(drop=True)
+    # sanity: solo 5 dígitos
+    df_cent["cve_mun"] = df_cent["cve_mun"].astype(str).str.strip().str[:5].str.zfill(5)
+    return df_cent
+
+def distancia_al_tratado_mas_cercano_con_centroides(
+    df_munis: pd.DataFrame,
+    geofile_path: str
+) -> pd.DataFrame:
+    """
+    df_munis: DataFrame con columnas:
+        - cve_mun (clave municipal INEGI, 5 dígitos)
+        - flg_tratado (0/1)
+    geofile_path: ruta a .shp o .zip de municipios (INEGI).
+
+    Devuelve df_munis + columnas lat/lon + dist_km_nearest_treated.
+    """
+    # Validación mínima
+    for c in ("cve_mun", "flg_tratado"):
+        if c not in df_munis.columns:
+            raise ValueError(f"Falta columna '{c}' en df_munis.")
+    df = df_munis.copy()
+    df["cve_mun"] = df["cve_mun"].map(_ensure_str_5)
+    df["flg_tratado"] = (df["flg_tratado"].astype(float) > 0).astype(int)
+
+    # Shapefile/ZIP -> centroides (WGS84)
+    shp_path = _open_vector(geofile_path)
+    cent = _centroids_from_shapefile(shp_path)
+
+    # Une centroides
+    df = df.merge(cent, on="cve_mun", how="left", validate="m:1")
+    if df["lat"].isna().any():
+        faltantes = df.loc[df["lat"].isna(), "cve_mun"].unique()[:10]
+        raise ValueError(f"Hay claves municipales sin centroide: {faltantes}")
+
+    # Distancia al tratado más cercano (Haversine)
+    lat = np.deg2rad(df["lat"].values.astype(float))
+    lon = np.deg2rad(df["lon"].values.astype(float))
+    X = np.c_[lat, lon]
+    treated = df["flg_tratado"].values.astype(bool)
+
+    if treated.sum() == 0:
+        df["dist_km_nearest_treated"] = np.nan
+        return df
+
+    tree = BallTree(X[treated], metric="haversine")
+    dist_rad, _ = tree.query(X, k=1)
+    R_km = 6371.0088
+    dist_km = dist_rad.flatten() * R_km
+    dist_km = np.where(treated, 0.0, dist_km)
+
+    df["dist_km_nearest_treated"] = dist_km
+    return df
+
+# ===== Ejemplo de uso =====
+# df_in = pd.DataFrame({
+#     "cve_mun": ["09002","09003","09004","09005"],
+#     "flg_tratado": [0,1,0,0]
+# })
+# out = distancia_al_tratado_mas_cercano_con_centroides(
+#     df_in,
+#     geofile_path="/mnt/data/mun21gw.zip"  # <- tu archivo ZIP subido
+# )
+# out.head()
