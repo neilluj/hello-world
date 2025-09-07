@@ -158,3 +158,24 @@ def distancia_al_tratado_mas_cercano_con_centroides(
         ok[["cve_mun","dist_km_nearest_treated"]], on="cve_mun", how="left"
     )
     return merged
+
+
+
+# Caso A: ya tienes 'cve_mun'
+out = distancia_al_tratado_mas_cercano_con_centroides(
+    df_munis,                 # tiene cve_mun y flg_tratado
+    geofile_path="mun21gw.zip",
+    on_missing="error"        # o "warn_fill_na" si quieres continuar
+)
+
+# Caso B: tienes columna de entidad y columna de municipio
+out = distancia_al_tratado_mas_cercano_con_centroides(
+    df_munis,                 # tiene cve_ent y cve_mun_cod + flg_tratado
+    geofile_path="mun21gw.zip",
+    ent_col="cve_ent", mun_col="cve_mun_cod",
+    on_missing="error"
+)
+
+# Ver cuáles faltaron (si elegiste warn_fill_na)
+faltaron = out[out["lat"].isna()]["cve_mun"].unique()
+print("Faltaron:", faltaron[:50])
