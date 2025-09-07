@@ -1,4 +1,4 @@
-import os, zipfile, re
+import os, zipfile, re, gc
 import numpy as np
 import pandas as pd
 import fiona
@@ -10,10 +10,7 @@ from sklearn.neighbors import BallTree
 def _ensure_str_5(x):
     if pd.isna(x): return np.nan
     s = str(x).strip()
-    s = re.sub(r"[^\d]", "", s)                 # quita comas, espacios, etc.
-    if s.endswith("0") and "." in str(x):       # caso '11001.0'
-        pass
-    # Si viene como 9-13 dígitos (localidad/AGEB), recorta a 5 (EE+MMM)
+    s = re.sub(r"[^\d]", "", s)
     if len(s) >= 5:
         s = s[:5]
     return s.zfill(5)
@@ -37,17 +34,14 @@ def _open_vector(path):
     return path
 
 def _detect_key_cols(fields, sample_props):
-    # Prefer CVEGEO
     for c in fields:
         if c.upper()=="CVEGEO": return ("single", c)
-    # EE + MMM
     ent, mun = None, None
     for c in fields:
         u = c.upper()
         if u in ("CVE_ENT","CVEENT","ENTIDAD","CVE_ENTIDAD","CVE_ENTI","CVEGEO_ENT"): ent = ent or c
         if u in ("CVE_MUN","CVEMUN","MUN","MUNICIPIO","CVE_MUNICIP"): mun = mun or c
     if ent and mun: return ("concat", (ent, mun))
-    # Último recurso: campo con muchos valores de 5 dígitos
     for c in fields:
         vals = [str(r.get(c,"")).strip() for r in sample_props]
         ratio = sum(1 for v in vals if re.fullmatch(r"\d{5}", re.sub(r"[^\d]","",v))) / max(1,len(vals))
@@ -72,7 +66,7 @@ def _centroids_from_shp(shp_path):
             props = feat["properties"]
             geom = feat["geometry"]
             if geom is None: continue
-            g = make_valid(shape(geom))  # repara si hay geometrías inválidas
+            g = make_valid(shape(geom))
             c = g.centroid
             cx, cy = c.x, c.y
             if to_wgs84 is not None:
@@ -81,8 +75,7 @@ def _centroids_from_shp(shp_path):
                 cve = _ensure_str_5(props[keyinfo])
             else:
                 ce, cm = keyinfo
-                cve = (str(props[ce]) + str(props[cm]))
-                cve = _ensure_str_5(cve)
+                cve = _ensure_str_5(str(props[ce]) + str(props[cm]))
             rows.append({"cve_mun": cve, "lat": cy, "lon": cx})
     df = pd.DataFrame(rows).drop_duplicates("cve_mun").reset_index(drop=True)
     return df
@@ -92,19 +85,18 @@ def distancia_al_tratado_mas_cercano_con_centroides(
     geofile_path: str,
     *,
     ent_col=None, mun_col=None,
-    on_missing="error"  # "error" | "warn_fill_na"
+    on_missing="error",      # "error" | "warn_fill_na"
+    chunk_size=200_000       # procesa consultas en lotes para reducir RAM
 ) -> pd.DataFrame:
     """
-    - df_munis: columnas requeridas -> 'cve_mun' o (ent_col, mun_col), y 'flg_tratado'
-    - geofile_path: ruta a .zip o .shp de municipios INEGI
-    - ent_col/mun_col: si tu df NO trae 'cve_mun' pero sí entidad/municipio por separado
-    - on_missing: si hay claves sin centroide: "error" (default) o "warn_fill_na" para dejarlas en NaN y continuar
+    Devuelve df con columnas lat, lon y dist_km_nearest_treated.
+    Optimizado para bajo uso de memoria: float32 + consultas por lotes.
     """
     if "flg_tratado" not in df_munis.columns:
         raise ValueError("Falta 'flg_tratado' en df_munis.")
     df = df_munis.copy()
 
-    # Arma cve_mun desde lo que tengas
+    # Construcción/normalización de cve_mun
     if "cve_mun" in df.columns:
         df["cve_mun"] = df["cve_mun"].apply(_ensure_str_5)
     elif ent_col and mun_col and ent_col in df.columns and mun_col in df.columns:
@@ -112,70 +104,63 @@ def distancia_al_tratado_mas_cercano_con_centroides(
     else:
         raise ValueError("Proporciona 'cve_mun' o (ent_col, mun_col).")
 
-    df["flg_tratado"] = (df["flg_tratado"].astype(float) > 0).astype(int)
+    df["flg_tratado"] = (df["flg_tratado"].astype(float) > 0).astype(np.uint8)
 
-    # Centroides desde shapefile
+    # Centroides
     shp_path = _open_vector(geofile_path)
     cent = _centroids_from_shp(shp_path)
 
-    # Merge
     merged = df.merge(cent, on="cve_mun", how="left", validate="m:1")
 
     # Diagnóstico de faltantes
-    miss = merged[merged["lat"].isna()].copy()
-    if not miss.empty:
-        unique_missing = miss["cve_mun"].dropna().unique().tolist()
-        print(f"[Diagnóstico] {len(unique_missing)} claves no encontraron centroide. Ejemplos:", unique_missing[:30])
-        # pistas de reparación
-        print("Sugerencias:")
-        print("- Verifica que 'cve_mun' sea municipal (5 dígitos), no localidad/AGEB.")
-        print("- Si tienes entidad/municipio separados, usa ent_col/mun_col para construir 'cve_mun'.")
-        print("- Asegura ceros a la izquierda (zfill).")
+    miss = merged["lat"].isna()
+    if miss.any():
+        falt = merged.loc[miss, "cve_mun"].dropna().unique().tolist()
+        print(f"[Diagnóstico] {len(falt)} claves sin centroide. Ejemplos:", falt[:30])
         if on_missing == "error":
-            raise ValueError("Hay claves municipales sin centroide (ver listado arriba). "
-                             "Si quieres continuar con NaN en esas filas, usa on_missing='warn_fill_na'.")
+            raise ValueError("Hay claves municipales sin centroide. Usa on_missing='warn_fill_na' para continuar.")
+        # si warn_fill_na, seguimos y esas filas quedarán con NaN en distancia
 
-    # Calcula distancias si hay al menos un tratado
+    # Si no hay tratados, no hay distancia que calcular
     if merged["flg_tratado"].sum() == 0:
         merged["dist_km_nearest_treated"] = np.nan
         return merged
 
+    # Mantén solo filas con lat/lon válidos para el cálculo
     ok = merged.dropna(subset=["lat","lon"]).copy()
-    lat = np.deg2rad(ok["lat"].astype(float).values)
-    lon = np.deg2rad(ok["lon"].astype(float).values)
-    X = np.c_[lat, lon]
-    treated = ok["flg_tratado"].astype(bool).values
 
-    tree = BallTree(X[treated], metric="haversine")
-    dist_rad, _ = tree.query(X, k=1)
-    R_km = 6371.0088
-    dist_km = dist_rad.flatten() * R_km
-    dist_km = np.where(treated, 0.0, dist_km)
-    ok["dist_km_nearest_treated"] = dist_km
+    # === Minimiza RAM: usa float32 y evita copias ===
+    lat = np.deg2rad(ok["lat"].to_numpy(dtype=np.float32, copy=False))
+    lon = np.deg2rad(ok["lon"].to_numpy(dtype=np.float32, copy=False))
+    treated = ok["flg_tratado"].to_numpy(dtype=bool, copy=False)
 
-    # Re-une con posibles NaN si on_missing='warn_fill_na'
+    # Conjunto tratado (para el árbol)
+    Xt = np.column_stack((lat[treated], lon[treated])).astype(np.float32, copy=False)
+    tree = BallTree(Xt, metric="haversine")
+
+    # Consulta por lotes para no reventar RAM
+    R_km = np.float32(6371.0088)
+    dist_out = np.empty(ok.shape[0], dtype=np.float32)
+
+    n = ok.shape[0]
+    start = 0
+    while start < n:
+        end = min(start + chunk_size, n)
+        Xq = np.column_stack((lat[start:end], lon[start:end])).astype(np.float32, copy=False)
+        dist_rad, _ = tree.query(Xq, k=1)
+        dist_km = (dist_rad.reshape(-1).astype(np.float32, copy=False) * R_km)
+        # Si el propio municipio está tratado => 0
+        dist_km = np.where(treated[start:end], np.float32(0.0), dist_km)
+        dist_out[start:end] = dist_km
+        # libera referencias intermedias
+        del Xq, dist_rad, dist_km
+        gc.collect()
+        start = end
+
+    ok["dist_km_nearest_treated"] = dist_out
+
+    # Re-une con el original (las filas sin lat/lon se quedarán NaN)
     merged = merged.drop(columns=["dist_km_nearest_treated"], errors="ignore").merge(
         ok[["cve_mun","dist_km_nearest_treated"]], on="cve_mun", how="left"
     )
     return merged
-
-
-
-# Caso A: ya tienes 'cve_mun'
-out = distancia_al_tratado_mas_cercano_con_centroides(
-    df_munis,                 # tiene cve_mun y flg_tratado
-    geofile_path="mun21gw.zip",
-    on_missing="error"        # o "warn_fill_na" si quieres continuar
-)
-
-# Caso B: tienes columna de entidad y columna de municipio
-out = distancia_al_tratado_mas_cercano_con_centroides(
-    df_munis,                 # tiene cve_ent y cve_mun_cod + flg_tratado
-    geofile_path="mun21gw.zip",
-    ent_col="cve_ent", mun_col="cve_mun_cod",
-    on_missing="error"
-)
-
-# Ver cuáles faltaron (si elegiste warn_fill_na)
-faltaron = out[out["lat"].isna()]["cve_mun"].unique()
-print("Faltaron:", faltaron[:50])
