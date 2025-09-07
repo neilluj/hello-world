@@ -1,0 +1,98 @@
+# pip install geopandas
+
+import geopandas as gpd
+import pandas as pd
+
+def marcar_adyacentes(
+    geofile: str,
+    df_flags: pd.DataFrame,
+    col_cve: str = "CVEGEO",
+) -> gpd.GeoDataFrame:
+    """
+    Marca municipios adyacentes a municipios tratados y agrega columnas:
+      - col_cve
+      - flg_tratado
+      - mes_inicio
+      - flg_adyacente
+      - cvegeo_tratado_vecino
+      - mes_inicio_tratado_vecino
+      - geometry
+
+    Parámetros
+    ----------
+    geofile : ruta al shapefile/geojson/zip (ej. "mun21gw.zip")
+    df_flags : DataFrame con columnas:
+        - col_cve (CVEGEO de 5 dígitos)
+        - flg_tratado (0/1)
+        - mes_inicio (cualquier tipo: fecha, str, int, etc.)
+    col_cve : nombre de la clave municipal en el shapefile y df_flags
+    """
+    # --- Carga y normaliza geografía
+    gdf = gpd.read_file(geofile)
+    gdf[col_cve] = gdf[col_cve].astype(str).str.strip().str[:5].str.zfill(5)
+
+    # --- Normaliza df_flags y une
+    req = [col_cve, "flg_tratado"]
+    if "mes_inicio" in df_flags.columns:
+        req.append("mes_inicio")
+    else:
+        # si falta, la creamos en NaN para evitar errores y mantener la columna en salida
+        df_flags = df_flags.copy()
+        df_flags["mes_inicio"] = pd.NA
+        req.append("mes_inicio")
+
+    flags = df_flags[req].copy()
+    flags[col_cve] = flags[col_cve].astype(str).str.strip().str[:5].str.zfill(5)
+    flags["flg_tratado"] = (flags["flg_tratado"].astype(float) > 0).astype(int)
+
+    gdf = gdf.merge(flags, on=col_cve, how="left")
+    gdf["flg_tratado"] = gdf["flg_tratado"].fillna(0).astype(int)
+
+    # --- CRS (si no tiene, asumimos WGS84)
+    if gdf.crs is None:
+        gdf = gdf.set_crs(epsg=4326)
+
+    # --- Subconjunto de tratados
+    tratados = gdf[gdf["flg_tratado"] == 1][[col_cve, "mes_inicio", "geometry"]].copy()
+    tratados = tratados.rename(columns={
+        col_cve: "CVEGEO_tratado",
+        "mes_inicio": "mes_inicio_tratado_vecino"
+    })
+
+    if tratados.empty:
+        gdf["flg_adyacente"] = 0
+        gdf["cvegeo_tratado_vecino"] = pd.NA
+        gdf["mes_inicio_tratado_vecino"] = pd.NA
+        return gdf[[col_cve, "flg_tratado", "mes_inicio",
+                    "flg_adyacente", "cvegeo_tratado_vecino",
+                    "mes_inicio_tratado_vecino", "geometry"]]
+
+    # --- Parejas (municipio, tratado) que se tocan (adyacencia)
+    # Nota: 'touches' ~ contacto por frontera/vértice; si quieres 'intersects', cambia el predicate.
+    pairs = gpd.sjoin(
+        gdf[[col_cve, "geometry"]],
+        tratados,
+        how="left",
+        predicate="touches"
+    )
+
+    # Nos quedamos con la primera coincidencia por municipio (puedes cambiar a 'list' si quieres todos)
+    pairs = pairs.dropna(subset=["index_right"]).copy()
+    vecinos = pairs.groupby(col_cve).agg({
+        "CVEGEO_tratado": "first",
+        "mes_inicio_tratado_vecino": "first"
+    }).reset_index()
+
+    # --- Integra resultados
+    gdf = gdf.merge(vecinos, on=col_cve, how="left")
+    gdf["flg_adyacente"] = gdf["CVEGEO_tratado"].notna().astype(int)
+
+    # Un tratado no es "adyacente a sí mismo"
+    gdf.loc[gdf["flg_tratado"] == 1, ["flg_adyacente", "CVEGEO_tratado", "mes_inicio_tratado_vecino"]] = [0, pd.NA, pd.NA]
+
+    # Renombrar columna final del vecino tratado
+    gdf = gdf.rename(columns={"CVEGEO_tratado": "cvegeo_tratado_vecino"})
+
+    return gdf[[col_cve, "flg_tratado", "mes_inicio",
+                "flg_adyacente", "cvegeo_tratado_vecino",
+                "mes_inicio_tratado_vecino", "geometry"]]
