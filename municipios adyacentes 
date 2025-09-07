@@ -1,0 +1,74 @@
+# Requisitos:
+# pip install geopandas
+
+import geopandas as gpd
+import pandas as pd
+
+def marcar_adyacentes(geofile: str, df_flags: pd.DataFrame, col_cve="CVEGEO") -> gpd.GeoDataFrame:
+    """
+    Marca municipios adyacentes a municipios tratados.
+    
+    Parámetros:
+    -----------
+    geofile : ruta al shapefile/zip de municipios INEGI (ej. "mun21gw.zip")
+    df_flags : DataFrame con columnas:
+        - col_cve (ej. CVEGEO de 5 dígitos)
+        - flg_tratado (0/1)
+    col_cve : nombre de la columna clave municipal en el shapefile
+    
+    Retorna:
+    --------
+    GeoDataFrame con columnas:
+        - col_cve
+        - flg_tratado
+        - flg_adyacente (1 si es adyacente a algún tratado, 0 en caso contrario)
+        - geometry
+    """
+    # Cargar municipios
+    gdf = gpd.read_file(geofile)
+    gdf[col_cve] = gdf[col_cve].astype(str).str.strip().str[:5].str.zfill(5)
+
+    # Une flag tratado
+    gdf = gdf.merge(df_flags[[col_cve, "flg_tratado"]], on=col_cve, how="left")
+    gdf["flg_tratado"] = gdf["flg_tratado"].fillna(0).astype(int)
+
+    # Asegura CRS a WGS84 (o usa proyección métrica si quieres más precisión)
+    if gdf.crs is None or gdf.crs.to_epsg() != 4326:
+        gdf = gdf.to_crs(epsg=4326)
+
+    # Selecciona tratados
+    tratados = gdf[gdf["flg_tratado"] == 1]
+
+    # Construir spatial index (rápido)
+    sindex = tratados.sindex
+
+    # Marca adyacentes
+    adyacentes = []
+    for idx, muni in gdf.iterrows():
+        if muni["flg_tratado"] == 1:
+            adyacentes.append(0)  # un tratado no es "adyacente a sí mismo"
+            continue
+
+        # Posibles vecinos (bounding box)
+        posibles = list(sindex.intersection(muni.geometry.bounds))
+        vecinos = tratados.iloc[posibles]
+
+        # Verifica si realmente tocan frontera
+        toca = any(muni.geometry.touches(otro) for _, otro in vecinos.iterrows())
+        adyacentes.append(1 if toca else 0)
+
+    gdf["flg_adyacente"] = adyacentes
+    return gdf
+
+# Tu df con flags
+df_flags = pd.DataFrame({
+    "CVEGEO": ["09002","09003","09004"],
+    "flg_tratado": [1,0,0]
+})
+
+# Ejecutar
+gdf_out = marcar_adyacentes("mun21gw.zip", df_flags, col_cve="CVEGEO")
+
+# Ver municipios tratados o adyacentes
+print(gdf_out[gdf_out["flg_tratado"]==1][["CVEGEO","flg_tratado","flg_adyacente"]].head())
+print(gdf_out[gdf_out["flg_adyacente"]==1][["CVEGEO","flg_tratado","flg_adyacente"]].head())
