@@ -1,0 +1,26 @@
+# Requisitos:
+# pip install geopandas
+
+import geopandas as gpd
+import pandas as pd
+
+def centroides_municipios(geofile: str, col_cve="CVEGEO") -> pd.DataFrame:
+    """
+    Lee shapefile/geojson/zip de municipios INEGI y devuelve DataFrame con:
+      - CVEGEO : clave municipal (5 dígitos)
+      - lat, lon: centroides en WGS84
+    """
+    gdf = gpd.read_file(geofile)
+    
+    # Normaliza la clave
+    gdf[col_cve] = gdf[col_cve].astype(str).str.strip().str[:5].str.zfill(5)
+    
+    # Asegura sistema de referencia WGS84
+    if gdf.crs is None or gdf.crs.to_epsg() != 4326:
+        gdf = gdf.to_crs(epsg=4326)
+    
+    # Calcula centroides
+    gdf["lon"] = gdf.geometry.centroid.x
+    gdf["lat"] = gdf.geometry.centroid.y
+    
+    return gdf[[col_cve, "lat", "lon"]].drop_duplicates().reset_index(drop=True)
