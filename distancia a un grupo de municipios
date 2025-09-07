@@ -1,0 +1,97 @@
+# -*- coding: utf-8 -*-
+"""
+Distancia al municipio tratado más cercano (sin lat/lon de entrada)
+Requisitos:
+  pip install pandas numpy geopandas shapely scikit-learn pyproj
+
+Entradas:
+  - df_munis: DataFrame con columnas:
+      * 'cve_mun' (string 5 dígitos, p.ej. '09002')
+      * 'flg_tratado' (0/1)
+  - geofile: ruta a shapefile (.shp) o GeoJSON de municipios INEGI
+             con la clave municipal (típicamente 'CVEGEO')
+
+Salida:
+  - df con columna 'dist_km_nearest_treated'
+"""
+
+import numpy as np
+import pandas as pd
+
+def _ensure_str_5(x):
+    if pd.isna(x): return np.nan
+    s = str(x).strip()
+    if s.endswith('.0'): s = s[:-2]
+    return s.zfill(5)
+
+def _load_centroids_from_geofile(geofile, muni_key_col_geofile='CVEGEO'):
+    import geopandas as gpd
+    gdf = gpd.read_file(geofile)
+
+    # Detecta automáticamente la columna de clave si no es 'CVEGEO'
+    if muni_key_col_geofile not in gdf.columns:
+        # intenta encontrar alguna que se parezca
+        candidatos = [c for c in gdf.columns if c.upper() in ('CVEGEO','CVE_MUN','CVE_MUNI','CVE_MUNICIPIO','CVEGEM')]
+        if not candidatos:
+            raise ValueError(f"No encuentro columna de clave municipal. Esperaba '{muni_key_col_geofile}'. Columnas: {list(gdf.columns)}")
+        muni_key_col_geofile = candidatos[0]
+
+    gdf = gdf.assign(cve_mun=gdf[muni_key_col_geofile].astype(str).str.strip().str.zfill(5))
+
+    # Centroides en proyección métrica y regreso a WGS84
+    gdf_m = gdf.to_crs(3857)
+    cent = gdf_m.geometry.centroid
+    gdf_cent = gpd.GeoDataFrame(gdf[['cve_mun']].copy(), geometry=cent, crs=3857).to_crs(4326)
+    gdf_cent['lon'] = gdf_cent.geometry.x
+    gdf_cent['lat'] = gdf_cent.geometry.y
+    return gdf_cent[['cve_mun','lat','lon']]
+
+def _nearest_treated_dist_km(lat, lon, treated_mask):
+    from sklearn.neighbors import BallTree
+    lat_r = np.deg2rad(lat.astype(float))
+    lon_r = np.deg2rad(lon.astype(float))
+    X = np.c_[lat_r, lon_r]
+
+    if treated_mask.sum() == 0:
+        return np.full(len(lat), np.nan)
+
+    tree = BallTree(X[treated_mask], metric='haversine')
+    dist_rad, _ = tree.query(X, k=1)
+    R_km = 6371.0088
+    dist_km = dist_rad.flatten() * R_km
+    dist_km = np.where(treated_mask, 0.0, dist_km)
+    return dist_km
+
+def distancia_al_tratado_mas_cercano(df_munis: pd.DataFrame, geofile: str, muni_key_col_geofile: str = 'CVEGEO') -> pd.DataFrame:
+    df = df_munis.copy()
+    # Validaciones y normalización
+    for col in ('cve_mun','flg_tratado'):
+        if col not in df.columns:
+            raise ValueError(f"Falta columna '{col}' en df_munis.")
+    df['cve_mun'] = df['cve_mun'].map(_ensure_str_5)
+    df['flg_tratado'] = (df['flg_tratado'].astype(float) > 0).astype(int)
+
+    # Centroides desde geofile
+    cent = _load_centroids_from_geofile(geofile, muni_key_col_geofile)
+    df = df.merge(cent, on='cve_mun', how='left', validate='m:1')
+    if df['lat'].isna().any():
+        faltantes = df.loc[df['lat'].isna(),'cve_mun'].unique()
+        raise ValueError(f"Hay claves sin geometría/centroide en el geofile. Ejemplos: {faltantes[:10]}")
+
+    # Distancia al tratado más cercano
+    df['dist_km_nearest_treated'] = _nearest_treated_dist_km(df['lat'].values, df['lon'].values, df['flg_tratado'].values.astype(bool))
+    return df
+
+# ======= EJEMPLO DE USO =======
+if __name__ == "__main__":
+    # df con solo clave municipal y flag
+    df_mis_municipios = pd.DataFrame({
+        'cve_mun': ['09002','09003','09004','09005'],
+        'flg_tratado': [0,1,0,0]
+    })
+
+    # Cambia por tu ruta local al shapefile/geojson de municipios (INEGI)
+    geofile = "/ruta/a/municipios_inegi.shp"  # o "/ruta/a/municipios.geojson"
+
+    out = distancia_al_tratado_mas_cercano(df_mis_municipios, geofile=geofile, muni_key_col_geofile='CVEGEO')
+    print(out[['cve_mun','flg_tratado','dist_km_nearest_treated']].head())
