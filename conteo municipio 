@@ -1,0 +1,13 @@
+import pandas as pd
+
+def add_acum_prev(df, mes_col='mes', muni_col='municipio', flag_col='flg_municipio_tratado'):
+    df = df.copy()
+    df[mes_col] = pd.to_datetime(df[mes_col]).dt.to_period('M').dt.to_timestamp('MS')
+    mes_inicio = df.loc[df[flag_col].eq(1)].groupby(muni_col)[mes_col].min()
+    meses = pd.Index(sorted(df[mes_col].unique()))
+    acum_prev = (mes_inicio.value_counts()
+                 .reindex(meses, fill_value=0).cumsum()
+                 .shift(1, fill_value=0)
+                 .rename('acum_mpios_tratados_prev')
+                 .rename_axis(mes_col).reset_index())
+    return df.merge(acum_prev, on=mes_col, how='left')
