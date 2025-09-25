@@ -1,0 +1,42 @@
+import pandas as pd
+
+def concat_dfs(dfs, ignore_index=True):
+    """
+    Concatena una lista de DataFrames verticalmente, alineando columnas.
+    - Si hay columnas duplicadas en algún DataFrame, se eliminan (manteniendo la primera).
+    - Las columnas que no existen en todos los DataFrames se rellenan con NaN.
+
+    Parámetros:
+    -----------
+    dfs : list of pd.DataFrame
+        Lista de DataFrames a concatenar.
+    ignore_index : bool, default=True
+        Si True, reinicia el índice en el DataFrame resultante.
+
+    Retorna:
+    --------
+    pd.DataFrame
+        DataFrame concatenado con columnas alineadas.
+    """
+    
+    cleaned_dfs = []
+    for df in dfs:
+        # Eliminar columnas duplicadas
+        df = df.loc[:, ~df.columns.duplicated()]
+        cleaned_dfs.append(df)
+
+    return pd.concat(cleaned_dfs, ignore_index=ignore_index)
+
+# Ejemplo de uso:
+df1 = pd.DataFrame({
+    "id": [1, 2, 3],
+    "nombre": ["Ana", "Luis", "Marta"]
+})
+
+df2 = pd.DataFrame({
+    "id": [4, 5],
+    "edad": [30, 25]
+})
+
+df_concat = concat_dfs([df1, df2])
+print(df_concat)
