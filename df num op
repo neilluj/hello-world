@@ -12,42 +12,35 @@ def operaciones_periodo(
     DF único por ID_USUARIO, ID_OPERACION y PERIODO (último día del mes o semana)
     con número total de transacciones en los tres periodos anteriores.
     """
+    # 1️⃣ Convertir fecha
+    df = df.with_column("FECHA_CONVERTIDA", F.to_date(F.substr(F.col(col_fecha), 1, 10), "YYYY-MM-DD"))
 
-    # 1️⃣ Extraer solo la fecha
-    df = df.with_column("FECHA_STR", F.substr(F.col(col_fecha), 1, 10))
-
-    # 2️⃣ Convertir a DATE
-    df = df.with_column("FECHA_CONVERTIDA", F.to_date(F.col("FECHA_STR"), "YYYY-MM-DD"))
-
-    # 3️⃣ Último día del mes o semana
+    # 2️⃣ Calcular periodo
     if modo == "m":
         df = df.with_column("PERIODO", F.last_day(F.col("FECHA_CONVERTIDA"), "month"))
         sufijo = "MES"
     elif modo == "s":
-        # semana termina el domingo
         df = df.with_column("PERIODO", F.dateadd("day", 6, F.date_trunc("week", F.col("FECHA_CONVERTIDA"))))
         sufijo = "SEMANA"
     else:
         raise ValueError("modo debe ser 'm' o 's'")
 
-    # 4️⃣ Contar número total de transacciones por usuario, operación y periodo
-    df_agg = (
-        df.group_by(col_usuario, col_operacion, "PERIODO")
-          .agg(F.count(F.lit(1)).alias("TRANSACCIONES"))
+    # 3️⃣ Contar transacciones por usuario, operación y periodo
+    df_agg = df.group_by(col_usuario, col_operacion, "PERIODO").agg(
+        F.count(F.lit(1)).alias("TRANSACCIONES")
     )
 
-    # 5️⃣ Window por usuario y operación ordenado por periodo
+    # 4️⃣ Window por usuario + operación ordenado por periodo
     w = Window.partition_by(col_usuario, col_operacion).order_by(F.col("PERIODO"))
 
-    # 6️⃣ Traer transacciones de los periodos anteriores
-    df_agg = (
-        df_agg
-        .with_column(f"TRANS_HACE_1_{sufijo}", F.lag("TRANSACCIONES", 1).over(w))
-        .with_column(f"TRANS_HACE_2_{sufijo}", F.lag("TRANSACCIONES", 2).over(w))
-        .with_column(f"TRANS_HACE_3_{sufijo}", F.lag("TRANSACCIONES", 3).over(w))
-    )
+    # 5️⃣ Lag de 1, 2 y 3 periodos anteriores y reemplazar NULL por 0
+    for i in range(1, 4):
+        df_agg = df_agg.with_column(
+            f"TRANS_HACE_{i}_{sufijo}",
+            F.coalesce(F.lag("TRANSACCIONES", i).over(w), F.lit(0))
+        )
 
-    # 7️⃣ Seleccionar columnas finales
+    # 6️⃣ Seleccionar columnas finales
     result = df_agg.select(
         col_usuario,
         col_operacion,
