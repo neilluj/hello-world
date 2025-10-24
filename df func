@@ -9,19 +9,12 @@ def operaciones_periodo(
     modo: str = "m"
 ):
     """
-    DF a nivel ID_USUARIO, ID_OPERACION y PERIODO (último día del mes o semana)
+    DF único por ID_USUARIO, ID_OPERACION y PERIODO (último día del mes o semana)
     con número de días con operaciones en los tres periodos anteriores.
-    
-    Estrategia:
-    - Filtra primero la fecha YYYY-MM-DD
-    - Convierte a DATE
-    - Trunca al último día del mes o semana según modo
     """
     
-    # 1️⃣ Extraer solo la fecha del string (YYYY-MM-DD)
-    df = df.with_column("FECHA_STR",
-        F.substr(F.col(col_fecha), 1, 10)
-    )
+    # 1️⃣ Extraer solo la fecha
+    df = df.with_column("FECHA_STR", F.substr(F.col(col_fecha), 1, 10))
     
     # 2️⃣ Convertir a DATE
     df = df.with_column("FECHA_CONVERTIDA", F.to_date(F.col("FECHA_STR"), "YYYY-MM-DD"))
@@ -29,37 +22,31 @@ def operaciones_periodo(
     # 3️⃣ Último día del mes o semana
     if modo == "m":
         df = df.with_column("PERIODO", F.last_day(F.col("FECHA_CONVERTIDA"), "month"))
-        unidad = "month"
         sufijo = "MES"
     elif modo == "s":
         df = df.with_column("PERIODO", F.dateadd("day", 6, F.date_trunc("week", F.col("FECHA_CONVERTIDA"))))
-        unidad = "week"
         sufijo = "SEMANA"
     else:
         raise ValueError("modo debe ser 'm' o 's'")
     
-    # 4️⃣ Contar días distintos por usuario y periodo
-    df_dias = (
-        df.group_by(col_usuario, "PERIODO")
+    # 4️⃣ Contar días distintos por usuario, operación y periodo
+    df_agg = (
+        df.group_by(col_usuario, col_operacion, "PERIODO")
           .agg(F.count_distinct(F.col("FECHA_CONVERTIDA")).alias("DIAS_OPERACION"))
     )
     
-    # 5️⃣ Window para periodos anteriores
+    # 5️⃣ Window solo por usuario para los periodos anteriores
     w = Window.partition_by(col_usuario).order_by(F.col("PERIODO"))
     
-    df_dias = (
-        df_dias
+    df_agg = (
+        df_agg
         .with_column(f"DIAS_HACE_1_{sufijo}", F.lag("DIAS_OPERACION", 1).over(w))
         .with_column(f"DIAS_HACE_2_{sufijo}", F.lag("DIAS_OPERACION", 2).over(w))
         .with_column(f"DIAS_HACE_3_{sufijo}", F.lag("DIAS_OPERACION", 3).over(w))
     )
     
-    # 6️⃣ Unir con tabla original para mantener ID_OPERACION
-    result = df.join(
-        df_dias,
-        on=[col_usuario, "PERIODO"],
-        how="left"
-    ).select(
+    # 6️⃣ El output ya es único por usuario, operación y periodo
+    result = df_agg.select(
         col_usuario,
         col_operacion,
         "PERIODO",
