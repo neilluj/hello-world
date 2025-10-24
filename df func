@@ -7,24 +7,22 @@ def operaciones_periodo(
     col_operacion: str,
     col_fecha: str,
     modo: str = "m",
-    formato_fecha: str = "YYYY-MM-DD"
+    formato_fecha: str = "YYYY-MM-DD HH24:MI:SS"
 ):
     """
     DF a nivel ID_USUARIO, ID_OPERACION y PERIODO (último día del mes o semana)
     con el número de días con operaciones en los tres periodos anteriores.
     
-    df: DataFrame original
-    col_usuario: nombre de la columna con ID de usuario
-    col_operacion: nombre de la columna con ID de operación
-    col_fecha: nombre de la columna con fecha de operación (VARCHAR)
-    modo: 'm' para mensual, 's' para semanal
-    formato_fecha: formato del string de fecha en Snowflake, por ejemplo 'YYYY-MM-DD HH24:MI:SS'
+    col_fecha puede contener timestamp en formato varchar.
     """
     
-    # 1️⃣ Convertir la columna de fecha de VARCHAR a DATE
-    df = df.with_column("FECHA_CONVERTIDA", F.to_date(F.col(col_fecha), formato_fecha))
+    # 1️⃣ Convertir VARCHAR a TIMESTAMP y luego a DATE
+    df = df.with_column(
+        "FECHA_CONVERTIDA",
+        F.to_date(F.to_timestamp(F.col(col_fecha), formato_fecha))
+    )
     
-    # 2️⃣ Crear columna PERIODO (último día del mes o semana)
+    # 2️⃣ Último día del mes o semana
     if modo == "m":
         df = df.with_column("PERIODO", F.last_day(F.col("FECHA_CONVERTIDA"), "month"))
         unidad = "month"
@@ -36,13 +34,13 @@ def operaciones_periodo(
     else:
         raise ValueError("modo debe ser 'm' o 's'")
     
-    # 3️⃣ Contar días distintos con operación por usuario y periodo
+    # 3️⃣ Contar días distintos por usuario y periodo
     df_dias = (
         df.group_by(col_usuario, "PERIODO")
           .agg(F.count_distinct(F.col("FECHA_CONVERTIDA")).alias("DIAS_OPERACION"))
     )
     
-    # 4️⃣ Crear ventana para calcular los 3 periodos anteriores
+    # 4️⃣ Window para 3 periodos anteriores
     w = Window.partition_by(col_usuario).order_by(F.col("PERIODO"))
     
     df_dias = (
@@ -52,7 +50,7 @@ def operaciones_periodo(
         .with_column(f"DIAS_HACE_3_{sufijo}", F.lag("DIAS_OPERACION", 3).over(w))
     )
     
-    # 5️⃣ Unir con la tabla original para incluir ID_OPERACION
+    # 5️⃣ Unir con tabla original para incluir ID_OPERACION
     result = df.join(
         df_dias,
         on=[col_usuario, "PERIODO"],
