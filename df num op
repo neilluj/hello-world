@@ -1,40 +1,60 @@
 from snowflake.snowpark import functions as F
 from snowflake.snowpark.window import Window
 
-def operaciones_periodo(df, col_fecha: str, col_operacion: str, col_usuario: str, m: str):
+def operaciones_periodo(
+    df,
+    col_usuario: str,
+    col_operacion: str,
+    col_fecha: str,
+    modo: str = "m"
+):
     """
-    Devuelve conteos por periodo y lags T-1, T-2, T-3 (mensual o semanal).
-    Usa lag() para calcular los lags por usuario+operacion ordenado por PERIODO.
+    DF único por ID_USUARIO, ID_OPERACION y PERIODO (último día del mes o semana)
+    con número total de transacciones en los tres periodos anteriores.
     """
-    # 1) Limpiar y truncar la fecha (solo YYYY-MM-DD)
-    df = df.with_column("FECHA_LIMPIA", F.to_date(F.substring(F.col(col_fecha), 1, 10)))
 
-    # 2) Crear PERIODO según mensual/semanal
-    if m == "mensual":
-        df = df.with_column("PERIODO", F.date_trunc("month", F.col("FECHA_LIMPIA")))
-    elif m == "semanal":
-        df = df.with_column("PERIODO", F.date_trunc("week", F.col("FECHA_LIMPIA")))
+    # 1️⃣ Extraer solo la fecha
+    df = df.with_column("FECHA_STR", F.substr(F.col(col_fecha), 1, 10))
+
+    # 2️⃣ Convertir a DATE
+    df = df.with_column("FECHA_CONVERTIDA", F.to_date(F.col("FECHA_STR"), "YYYY-MM-DD"))
+
+    # 3️⃣ Último día del mes o semana
+    if modo == "m":
+        df = df.with_column("PERIODO", F.last_day(F.col("FECHA_CONVERTIDA"), "month"))
+        sufijo = "MES"
+    elif modo == "s":
+        # semana termina el domingo
+        df = df.with_column("PERIODO", F.dateadd("day", 6, F.date_trunc("week", F.col("FECHA_CONVERTIDA"))))
+        sufijo = "SEMANA"
     else:
-        raise ValueError("El parámetro m debe ser 'mensual' o 'semanal'")
+        raise ValueError("modo debe ser 'm' o 's'")
 
-    # 3) Agregar conteo por user/op/periodo
-    base = (
+    # 4️⃣ Contar número total de transacciones por usuario, operación y periodo
+    df_agg = (
         df.group_by(col_usuario, col_operacion, "PERIODO")
-          .agg(F.count("*").alias("OPERACIONES"))
+          .agg(F.count(F.lit(1)).alias("TRANSACCIONES"))
     )
 
-    # 4) Definir ventana por usuario+operación ordenada por periodo ascendente
-    win = Window.partition_by(F.col(col_usuario), F.col(col_operacion)).order_by(F.col("PERIODO"))
+    # 5️⃣ Window por usuario y operación ordenado por periodo
+    w = Window.partition_by(col_usuario, col_operacion).order_by(F.col("PERIODO"))
 
-    # 5) Calcular lags T-1, T-2, T-3 usando lag()
-    base = base.with_column("OPERACIONES_T-1", F.lag(F.col("OPERACIONES"), 1).over(win)) \
-               .with_column("OPERACIONES_T-2", F.lag(F.col("OPERACIONES"), 2).over(win)) \
-               .with_column("OPERACIONES_T-3", F.lag(F.col("OPERACIONES"), 3).over(win))
+    # 6️⃣ Traer transacciones de los periodos anteriores
+    df_agg = (
+        df_agg
+        .with_column(f"TRANS_HACE_1_{sufijo}", F.lag("TRANSACCIONES", 1).over(w))
+        .with_column(f"TRANS_HACE_2_{sufijo}", F.lag("TRANSACCIONES", 2).over(w))
+        .with_column(f"TRANS_HACE_3_{sufijo}", F.lag("TRANSACCIONES", 3).over(w))
+    )
 
-    # 6) Rellenar NULLs por 0 en los lags (y opcionalmente en OPERACIONES)
-    base = base.with_column("OPERACIONES_T-1", F.coalesce(F.col("OPERACIONES_T-1"), F.lit(0))) \
-               .with_column("OPERACIONES_T-2", F.coalesce(F.col("OPERACIONES_T-2"), F.lit(0))) \
-               .with_column("OPERACIONES_T-3", F.coalesce(F.col("OPERACIONES_T-3"), F.lit(0))) \
-               .with_column("OPERACIONES", F.coalesce(F.col("OPERACIONES"), F.lit(0)))
+    # 7️⃣ Seleccionar columnas finales
+    result = df_agg.select(
+        col_usuario,
+        col_operacion,
+        "PERIODO",
+        f"TRANS_HACE_1_{sufijo}",
+        f"TRANS_HACE_2_{sufijo}",
+        f"TRANS_HACE_3_{sufijo}"
+    )
 
-    return base
+    return result
