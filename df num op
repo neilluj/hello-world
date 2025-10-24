@@ -1,54 +1,40 @@
 from snowflake.snowpark import functions as F
+from snowflake.snowpark.window import Window
 
 def operaciones_periodo(df, col_fecha: str, col_operacion: str, col_usuario: str, m: str):
     """
-    Calcula el número de operaciones realizadas por usuario y operación
-    en los periodos actual, t-1, t-2 y t-3 (mensual o semanal).
-
-    Parámetros:
-    - df: DataFrame de Snowpark
-    - col_fecha: nombre de la columna con la fecha (varchar)
-    - col_operacion: nombre de la columna con el ID de la operación
-    - col_usuario: nombre de la columna con el ID del usuario
-    - m: 'mensual' o 'semanal'
+    Devuelve conteos por periodo y lags T-1, T-2, T-3 (mensual o semanal).
+    Usa lag() para calcular los lags por usuario+operacion ordenado por PERIODO.
     """
-    
-    # Limpiar formato de fecha (solo primeros 10 caracteres)
+    # 1) Limpiar y truncar la fecha (solo YYYY-MM-DD)
     df = df.with_column("FECHA_LIMPIA", F.to_date(F.substring(F.col(col_fecha), 1, 10)))
-    
-    # Crear columna de periodo según el modo
+
+    # 2) Crear PERIODO según mensual/semanal
     if m == "mensual":
         df = df.with_column("PERIODO", F.date_trunc("month", F.col("FECHA_LIMPIA")))
-        delta = "month"
     elif m == "semanal":
         df = df.with_column("PERIODO", F.date_trunc("week", F.col("FECHA_LIMPIA")))
-        delta = "week"
     else:
         raise ValueError("El parámetro m debe ser 'mensual' o 'semanal'")
-    
-    # Contar operaciones por usuario, operación y periodo
+
+    # 3) Agregar conteo por user/op/periodo
     base = (
         df.group_by(col_usuario, col_operacion, "PERIODO")
-        .agg(F.count("*").alias("OPERACIONES"))
+          .agg(F.count("*").alias("OPERACIONES"))
     )
-    
-    # Unir con los periodos desplazados (t-1, t-2, t-3)
-    for i in [1, 2, 3]:
-        base = base.join(
-            base.select(
-                F.col(col_usuario).alias("USR_JOIN"),
-                F.col(col_operacion).alias("OP_JOIN"),
-                F.dateadd(delta, i, F.col("PERIODO")).alias("PERIODO_JOIN"),
-                F.col("OPERACIONES").alias(f"OPERACIONES_T-{i}")
-            ),
-            (F.col(col_usuario) == F.col("USR_JOIN")) &
-            (F.col(col_operacion) == F.col("OP_JOIN")) &
-            (F.col("PERIODO") == F.col("PERIODO_JOIN")),
-            how="left"
-        ).drop("USR_JOIN", "OP_JOIN", "PERIODO_JOIN")
 
-    # Rellenar nulos con 0
-    for i in [1, 2, 3]:
-        base = base.with_column(f"OPERACIONES_T-{i}", F.coalesce(F.col(f"OPERACIONES_T-{i}"), F.lit(0)))
-    
+    # 4) Definir ventana por usuario+operación ordenada por periodo ascendente
+    win = Window.partition_by(F.col(col_usuario), F.col(col_operacion)).order_by(F.col("PERIODO"))
+
+    # 5) Calcular lags T-1, T-2, T-3 usando lag()
+    base = base.with_column("OPERACIONES_T-1", F.lag(F.col("OPERACIONES"), 1).over(win)) \
+               .with_column("OPERACIONES_T-2", F.lag(F.col("OPERACIONES"), 2).over(win)) \
+               .with_column("OPERACIONES_T-3", F.lag(F.col("OPERACIONES"), 3).over(win))
+
+    # 6) Rellenar NULLs por 0 en los lags (y opcionalmente en OPERACIONES)
+    base = base.with_column("OPERACIONES_T-1", F.coalesce(F.col("OPERACIONES_T-1"), F.lit(0))) \
+               .with_column("OPERACIONES_T-2", F.coalesce(F.col("OPERACIONES_T-2"), F.lit(0))) \
+               .with_column("OPERACIONES_T-3", F.coalesce(F.col("OPERACIONES_T-3"), F.lit(0))) \
+               .with_column("OPERACIONES", F.coalesce(F.col("OPERACIONES"), F.lit(0)))
+
     return base
