@@ -10,34 +10,15 @@ def operaciones_periodo(
     """
     Calcula, a nivel de ID usuario + ID operación + periodo (mes o semana),
     el número total de operaciones en el periodo actual y las 3 anteriores.
-
-    Parámetros:
-    -----------
-    df : DataFrame de Snowpark
-        Contiene las columnas de fecha, usuario y operación.
-    col_fecha : str
-        Nombre de la columna con la fecha (en formato VARCHAR).
-    col_usuario : str
-        Nombre de la columna con el ID del usuario.
-    col_operacion : str
-        Nombre de la columna con el ID de la operación.
-    frecuencia : str
-        'mensual' o 'semanal'.
-
-    Output:
-    -------
-    DataFrame con columnas:
-        ID usuario, ID operación, periodo (último día del mes o semana),
-        y número total de operaciones en los últimos 1, 2 y 3 periodos.
     """
 
-    # Filtrar y convertir fecha (quedarse solo con la parte YYYY-MM-DD)
+    # 1️⃣ Limpiar y convertir la fecha
     df = df.with_column(
         "FECHA_LIMPIA",
         F.to_date(F.substring(F.col(col_fecha), 1, 10), "YYYY-MM-DD")
     ).filter(F.col("FECHA_LIMPIA").is_not_null())
 
-    # Definir periodo (último día de mes o semana)
+    # 2️⃣ Definir el periodo (último día del mes o domingo de la semana)
     if frecuencia == "mensual":
         df = df.with_column(
             "PERIODO",
@@ -47,25 +28,25 @@ def operaciones_periodo(
     elif frecuencia == "semanal":
         df = df.with_column(
             "PERIODO",
-            F.dateadd("day", 6, F.date_trunc("week", F.col("FECHA_LIMPIA")))
+            F.dateadd("day", F.lit(6), F.date_trunc("week", F.col("FECHA_LIMPIA")))
         )
         lag = "week"
     else:
         raise ValueError("El parámetro 'frecuencia' debe ser 'mensual' o 'semanal'")
 
-    # Contar total de operaciones (no días distintos)
+    # 3️⃣ Contar total de operaciones (no días distintos)
     df_agregado = (
         df.group_by(col_usuario, col_operacion, F.col("PERIODO"))
           .agg(F.count("*").alias("TOTAL_OPERACIONES"))
     )
 
-    # Crear versiones desplazadas (1, 2 y 3 periodos anteriores)
+    # 4️⃣ Crear versiones desplazadas (1, 2 y 3 periodos anteriores)
     df_lags = [df_agregado]
     for i in range(1, 4):
         alias = f"df_lag{i}"
         df_lag = (
             df_agregado
-            .with_column("PERIODO", F.dateadd(lag, i, F.col("PERIODO")))
+            .with_column("PERIODO", F.dateadd(lag, F.lit(i), F.col("PERIODO")))
             .select(
                 F.col(col_usuario),
                 F.col(col_operacion),
@@ -75,7 +56,7 @@ def operaciones_periodo(
         )
         df_lags.append(df_lag)
 
-    # Unir todas las versiones
+    # 5️⃣ Unir todas las versiones
     df_final = df_lags[0]
     for i in range(1, 4):
         df_final = (
@@ -86,7 +67,7 @@ def operaciones_periodo(
             )
         )
 
-    # Reemplazar nulos por 0 (no hubo operaciones ese periodo)
+    # 6️⃣ Reemplazar nulos por 0
     for i in range(1, 4):
         df_final = df_final.with_column(
             f"OPERACIONES_HACE_{i}_{frecuencia.upper()}",
