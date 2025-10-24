@@ -12,17 +12,19 @@ def operaciones_periodo(
     DF a nivel ID_USUARIO, ID_OPERACION y PERIODO (último día del mes o semana)
     con número de días con operaciones en los tres periodos anteriores.
     
-    Robustez: convierte a DATE y descarta registros que no puedan convertirse.
+    Estrategia:
+    - Filtra primero la fecha YYYY-MM-DD
+    - Convierte a DATE
+    - Trunca al último día del mes o semana según modo
     """
     
-    # 1️⃣ Intentar convertir a TIMESTAMP y luego a DATE, truncando hora
-    df = df.with_column(
-        "FECHA_CONVERTIDA",
-        F.try_to_date(F.try_to_timestamp(F.col(col_fecha)))
+    # 1️⃣ Extraer solo la fecha del string (YYYY-MM-DD)
+    df = df.with_column("FECHA_STR",
+        F.substr(F.col(col_fecha), 1, 10)
     )
     
-    # 2️⃣ Filtrar registros donde la conversión falló
-    df = df.filter(F.col("FECHA_CONVERTIDA").is_not_null())
+    # 2️⃣ Convertir a DATE
+    df = df.with_column("FECHA_CONVERTIDA", F.to_date(F.col("FECHA_STR"), "YYYY-MM-DD"))
     
     # 3️⃣ Último día del mes o semana
     if modo == "m":
@@ -52,7 +54,7 @@ def operaciones_periodo(
         .with_column(f"DIAS_HACE_3_{sufijo}", F.lag("DIAS_OPERACION", 3).over(w))
     )
     
-    # 6️⃣ Unir con original para mantener ID_OPERACION
+    # 6️⃣ Unir con tabla original para mantener ID_OPERACION
     result = df.join(
         df_dias,
         on=[col_usuario, "PERIODO"],
