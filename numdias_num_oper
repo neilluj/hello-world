@@ -1,0 +1,123 @@
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+
+def num_operaciones_periodo_pyspark_opt(df, col_usuario: str, col_operacion: str, col_fecha: str, modo: str = "m"):
+    """
+    Versión optimizada en PySpark:
+    DF único por usuario, operación y PERIODO (último día del mes o semana)
+    con número de días con operaciones en los tres periodos anteriores.
+    """
+
+    # 1️⃣ Convertir fecha y calcular período directamente
+    fecha_col = F.to_date(F.substring(F.col(col_fecha), 1, 10), "yyyy-MM-dd")
+    
+    if modo == "m":
+        periodo_col = F.last_day(fecha_col)
+        sufijo = "M"
+    elif modo == "s":
+        periodo_col = F.date_add(F.date_trunc("week", fecha_col), 6)
+        sufijo = "SEM"
+    else:
+        raise ValueError("modo debe ser 'm' o 's'")
+    
+    df = df.withColumn("PERIODO", periodo_col)
+    df = df.withColumn("FECHA_CONVERTIDA", fecha_col)
+    
+    # 2️⃣ Agrupar por usuario, operación y periodo contando días distintos
+    df_agg = (
+        df.groupBy(col_usuario, col_operacion, "PERIODO")
+          .agg(F.count("FECHA_CONVERTIDA").alias(f"NUM_OPER_{sufijo}"))
+    )
+    
+    # 3️⃣ Window para periodos anteriores por usuario y operación
+    w = Window.partitionBy(col_usuario, col_operacion).orderBy("PERIODO")
+    
+    for i in range(1, 4):
+        df_agg = df_agg.withColumn(f"NUM_OPER_{sufijo}_{i}", F.lag(f"NUM_OPER_{sufijo}", i).over(w))
+    
+    # 4️⃣ Selección final
+    result = df_agg.select(
+        col_usuario,
+        col_operacion,
+        "PERIODO",
+        f"NUM_OPER_{sufijo}",
+        *[f"NUM_OPER_{sufijo}_{i}" for i in range(1, 4)]
+    ).fillna(0)
+
+    pivot_df = result.groupBy(col_usuario, "PERIODO") \
+    .pivot(col_operacion) \
+    .agg(
+        F.sum("NUM_OPER_M").alias("NUM_OPER_M"),
+        F.sum("NUM_OPER_M_1").alias("NUM_OPER_M_1"),
+        F.sum("NUM_OPER_M_2").alias("NUM_OPER_M_2"),
+        F.sum("NUM_OPER_M_3").alias("NUM_OPER_M_3")
+    ).fillna(0)
+
+
+
+result_df_num_oper = num_operaciones_periodo_pyspark_opt(df, "id_usuario", "id_operacion", "fecha_operacion", modo="m")
+
+
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+
+def operaciones_periodo_pyspark_opt(df, col_usuario: str, col_operacion: str, col_fecha: str, modo: str = "m"):
+    """
+    Versión optimizada en PySpark:
+    DF único por usuario, operación y PERIODO (último día del mes o semana)
+    con número de días con operaciones en los tres periodos anteriores.
+    """
+
+    # 1️⃣ Convertir fecha y calcular período directamente
+    fecha_col = F.to_date(F.substring(F.col(col_fecha), 1, 10), "yyyy-MM-dd")
+    
+    if modo == "m":
+        periodo_col = F.last_day(fecha_col)
+        sufijo = "M"
+    elif modo == "s":
+        periodo_col = F.date_add(F.date_trunc("week", fecha_col), 6)
+        sufijo = "SEM"
+    else:
+        raise ValueError("modo debe ser 'm' o 's'")
+    
+    df = df.withColumn("PERIODO", periodo_col)
+    df = df.withColumn("FECHA_CONVERTIDA", fecha_col)
+    
+    # 2️⃣ Agrupar por usuario, operación y periodo contando días distintos
+    df_agg = (
+        df.groupBy(col_usuario, col_operacion, "PERIODO")
+          .agg(F.countDistinct("FECHA_CONVERTIDA").alias(f"NUM_OPER_{sufijo}"))
+    )
+    
+    # 3️⃣ Window para periodos anteriores por usuario y operación
+    w = Window.partitionBy(col_usuario, col_operacion).orderBy("PERIODO")
+    
+    for i in range(1, 4):
+        df_agg = df_agg.withColumn(f"NUM_OPER_{sufijo}_{i}", F.lag(f"NUM_OPER_{sufijo}", i).over(w))
+    
+    # 4️⃣ Selección final
+    result = df_agg.select(
+        col_usuario,
+        col_operacion,
+        "PERIODO",
+        f"NUM_OPER_{sufijo}",
+        *[f"NUM_OPER_{sufijo}_{i}" for i in range(1, 4)]
+    ).fillna(0)
+
+    pivot_df = result.groupBy(col_usuario, "PERIODO") \
+    .pivot(col_operacion) \
+    .agg(
+        F.sum("NUM_OPER_M").alias("NUM_OPER_M"),
+        F.sum("NUM_OPER_M_1").alias("NUM_OPER_M_1"),
+        F.sum("NUM_OPER_M_2").alias("NUM_OPER_M_2"),
+        F.sum("NUM_OPER_M_3").alias("NUM_OPER_M_3")
+    ).fillna(0)
+
+    
+    
+    return pivot_df
+
+
+result_df = operaciones_periodo_pyspark_opt(df, "id_usuario", "id_operacion", "fecha_operacion", modo="m")
+    
+    return pivot_df
