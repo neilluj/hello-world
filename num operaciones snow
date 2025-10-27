@@ -1,0 +1,58 @@
+from snowflake.snowpark import functions as F
+from snowflake.snowpark.window import Window
+
+def num_operaciones_periodo_snowpark_opt(df, col_usuario: str, col_operacion: str, col_fecha: str, modo: str = "m"):
+    """
+    Versión optimizada en Snowpark:
+    DF único por usuario, operación y PERIODO (último día del mes o semana)
+    con número de días con operaciones en los tres periodos anteriores.
+    """
+
+    # 1️⃣ Convertir fecha y calcular periodo directamente
+    fecha_col = F.to_date(F.substring(F.col(col_fecha), 1, 10))
+
+    if modo == "m":
+        periodo_col = F.last_day(fecha_col)
+        sufijo = "M"
+    elif modo == "s":
+        periodo_col = F.dateadd("day", 6, F.date_trunc("week", fecha_col))
+        sufijo = "SEM"
+    else:
+        raise ValueError("modo debe ser 'm' o 's'")
+
+    df = df.with_column("PERIODO", periodo_col)
+    df = df.with_column("FECHA_CONVERTIDA", fecha_col)
+
+    # 2️⃣ Agrupar por usuario, operación y periodo contando días (aquí es count directo)
+    df_agg = (
+        df.group_by(col_usuario, col_operacion, F.col("PERIODO"))
+          .agg(F.count("FECHA_CONVERTIDA").alias(f"NUM_OPER_{sufijo}"))
+    )
+
+    # 3️⃣ Window para periodos anteriores por usuario y operación
+    w = Window.partition_by(col_usuario, col_operacion).order_by(F.col("PERIODO"))
+
+    for i in range(1, 4):
+        df_agg = df_agg.with_column(
+            f"NUM_OPER_{sufijo}_{i}", 
+            F.lag(f"NUM_OPER_{sufijo}", i).over(w)
+        )
+
+    # 4️⃣ Reemplazar nulos por 0
+    cols = [f"NUM_OPER_{sufijo}"] + [f"NUM_OPER_{sufijo}_{i}" for i in range(1, 4)]
+    for c in cols:
+        df_agg = df_agg.with_column(c, F.coalesce(F.col(c), F.lit(0)))
+
+    # 5️⃣ Pivot final (por usuario y periodo)
+    pivot_df = (
+        df_agg.group_by(col_usuario, "PERIODO")
+              .pivot(col_operacion)
+              .agg(
+                  F.sum(f"NUM_OPER_{sufijo}").alias(f"NUM_OPER_{sufijo}"),
+                  F.sum(f"NUM_OPER_{sufijo}_1").alias(f"NUM_OPER_{sufijo}_1"),
+                  F.sum(f"NUM_OPER_{sufijo}_2").alias(f"NUM_OPER_{sufijo}_2"),
+                  F.sum(f"NUM_OPER_{sufijo}_3").alias(f"NUM_OPER_{sufijo}_3")
+              )
+    )
+
+    return pivot_df
