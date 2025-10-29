@@ -1,0 +1,6 @@
+def banderas_medianas(df, col_id):
+    num = df.select_dtypes("number")
+    return pd.concat(
+        [df[[col_id]], (num.gt(num.median())).astype(int).add_prefix("flag_")],
+        axis=1
+    )
