@@ -1,0 +1,286 @@
+"""
+Implementación sencilla de Latent Class Analysis (LCA) para variables binarias
+(usando EM) - implementación propia, inspirada en la teoría (no copia de StepMix).
+
+Funciones principales:
+- class BinaryLCA: implementación con fit, predict_proba, predict, bic, aic, score
+- ejemplo de uso: simulación de datos, ajuste, impresión de resultados
+
+Requisitos: numpy, pandas (opcional)
+
+Autor: generado por ChatGPT
+"""
+
+import numpy as np
+import pandas as pd
+from typing import Optional
+
+
+class BinaryLCA:
+    """LCA para variables binarias usando EM.
+
+    Parámetros
+    ----------
+    n_components : int
+        Número de clases latentes (K).
+    tol : float
+        Tolerancia para convergencia en log-likelihood.
+    max_iter : int
+        Iteraciones máximas del EM.
+    random_state : Optional[int]
+        Semilla para reproducibilidad.
+    verbose : bool
+        Si True imprime progreso.
+    """
+
+    def __init__(self, n_components: int, tol: float = 1e-6, max_iter: int = 1000,
+                 random_state: Optional[int] = None, verbose: bool = False):
+        self.n_components = int(n_components)
+        self.tol = tol
+        self.max_iter = int(max_iter)
+        self.random_state = random_state
+        self.verbose = bool(verbose)
+
+        # parámetros a aprender
+        self.pi_ = None            # pesos de mezcla (K,)
+        self.theta_ = None         # probabilidades por ítem por clase (K, J)
+        self.log_likelihood_ = []
+
+    def _initialize(self, X: np.ndarray):
+        n, J = X.shape
+        rng = np.random.RandomState(self.random_state)
+
+        # initialize mixture weights (pi) con Dirichlet uniforme
+        pi = rng.dirichlet(alpha=np.ones(self.n_components))
+
+        # initialize theta: probabilidad de X_j = 1 dado clase k
+        # evitar 0/1 exactos: inicialización aleatoria en (0.1, 0.9)
+        theta = rng.rand(self.n_components, J) * 0.8 + 0.1
+
+        # asignar
+        self.pi_ = pi
+        self.theta_ = theta
+
+    def _e_step(self, X: np.ndarray):
+        # calcula la matriz gamma (N, K): posterior P(Z=k | X)
+        n, J = X.shape
+        K = self.n_components
+
+        # log p(X | Z=k) = sum_j x_ij log theta_kj + (1-x_ij) log(1-theta_kj)
+        # shape: (K, n)
+        log_likelihoods = np.zeros((K, n))
+        for k in range(K):
+            # sumar por columnas
+            theta_k = self.theta_[k]  # (J,)
+            # evitar log(0)
+            eps = 1e-12
+            term1 = X * np.log(theta_k + eps)
+            term2 = (1 - X) * np.log(1 - theta_k + eps)
+            log_likelihoods[k, :] = term1.sum(axis=1) + term2.sum(axis=1)
+
+        # añadir log pi
+        log_pi = np.log(self.pi_ + 1e-12)[:, None]  # (K,1)
+        log_joint = log_pi + log_likelihoods  # (K, n)
+
+        # para estabilidad: restar max por columna
+        max_log = np.max(log_joint, axis=0)
+        stabilized = np.exp(log_joint - max_log)
+        # gamma = normalized stabilized
+        gamma = stabilized / stabilized.sum(axis=0)
+        # gamma transpuesta a (n, K)
+        return gamma.T, log_joint
+
+    def _m_step(self, X: np.ndarray, gamma: np.ndarray):
+        # gamma: (n, K)
+        n, J = X.shape
+        K = self.n_components
+
+        Nk = gamma.sum(axis=0)  # (K,)
+        # actualizar pi
+        pi_new = Nk / n
+
+        # actualizar theta: 
+        # theta_{kj} = sum_i gamma_{ik} * x_ij / Nk
+        theta_new = np.zeros((K, J))
+        for k in range(K):
+            weights = gamma[:, k][:, None]  # (n,1)
+            numerator = (weights * X).sum(axis=0)
+            # suavizado para evitar 0/1 extremos (Laplace-like): agregar eps
+            theta_new[k] = numerator / (Nk[k] + 1e-12)
+
+        # asegurar límites (eps, 1-eps)
+        eps = 1e-8
+        theta_new = np.clip(theta_new, eps, 1 - eps)
+
+        self.pi_ = pi_new
+        self.theta_ = theta_new
+
+    def _compute_log_likelihood(self, log_joint: np.ndarray):
+        # log_joint shape: (K, n) -> log p(X, Z=k)
+        # log p(X) = logsumexp_k log_joint_k
+        max_log = np.max(log_joint, axis=0)
+        sum_exp = np.exp(log_joint - max_log).sum(axis=0)
+        log_px = max_log + np.log(sum_exp + 1e-12)
+        return log_px.sum()
+
+    def fit(self, X, init_params: str = 'random'):
+        """Ajusta el modelo a una matriz X (n_samples, n_features) con 0/1.
+
+        Parámetros
+        ----------
+        X : array-like
+            Matriz N x J con valores 0/1.
+        init_params : str
+            'random' (por defecto) o 'kmeans' (no implementado pero reservado).
+        """
+        X = np.asarray(X, dtype=float)
+        if X.ndim != 2:
+            raise ValueError("X debe ser una matriz 2D")
+        n, J = X.shape
+
+        # inicializar parámetros
+        self._initialize(X)
+
+        prev_ll = -np.inf
+        self.log_likelihood_ = []
+
+        for it in range(self.max_iter):
+            gamma, log_joint = self._e_step(X)
+            ll = self._compute_log_likelihood(log_joint)
+            self.log_likelihood_.append(ll)
+
+            # M-step
+            self._m_step(X, gamma)
+
+            if self.verbose and (it % 10 == 0 or it == self.max_iter - 1):
+                print(f"Iter {it:4d} - LogLik: {ll:.6f}")
+
+            # check convergence
+            if np.abs(ll - prev_ll) < self.tol:
+                if self.verbose:
+                    print(f"Convergencia en iter {it}: ll cambio {ll - prev_ll:.6e}")
+                break
+            prev_ll = ll
+
+        return self
+
+    def predict_proba(self, X):
+        """Devuelve posterior P(Z=k | X) para cada muestra.
+
+        Returns
+        -------
+        gamma : array (n, K)
+        """
+        X = np.asarray(X, dtype=float)
+        n, J = X.shape
+        K = self.n_components
+
+        # recompute log_joint with current params
+        log_likelihoods = np.zeros((K, n))
+        for k in range(K):
+            theta_k = self.theta_[k]
+            term1 = X * np.log(theta_k + 1e-12)
+            term2 = (1 - X) * np.log(1 - theta_k + 1e-12)
+            log_likelihoods[k, :] = term1.sum(axis=1) + term2.sum(axis=1)
+        log_pi = np.log(self.pi_ + 1e-12)[:, None]
+        log_joint = log_pi + log_likelihoods
+
+        max_log = np.max(log_joint, axis=0)
+        stabilized = np.exp(log_joint - max_log)
+        gamma = (stabilized / stabilized.sum(axis=0)).T  # (n,K)
+        return gamma
+
+    def predict(self, X):
+        """Asignación dura de clases (máxima posterior)."""
+        gamma = self.predict_proba(X)
+        return gamma.argmax(axis=1)
+
+    def bic(self, X):
+        """Calcula BIC para el modelo ajustado.
+
+        Número de parámetros: (K-1) para pi + K*J para theta
+        """
+        n, J = X.shape
+        K = self.n_components
+        ll = self.log_likelihood_[-1]
+        n_params = (K - 1) + K * J
+        bic = -2 * ll + n_params * np.log(n)
+        return bic
+
+    def aic(self, X):
+        n, J = X.shape
+        K = self.n_components
+        ll = self.log_likelihood_[-1]
+        n_params = (K - 1) + K * J
+        aic = -2 * ll + 2 * n_params
+        return aic
+
+    def score(self, X):
+        """Log-likelihood por muestra del modelo ajustado."""
+        X = np.asarray(X, dtype=float)
+        n, J = X.shape
+        # recompute log_joint
+        K = self.n_components
+        log_likelihoods = np.zeros((K, n))
+        for k in range(K):
+            theta_k = self.theta_[k]
+            term1 = X * np.log(theta_k + 1e-12)
+            term2 = (1 - X) * np.log(1 - theta_k + 1e-12)
+            log_likelihoods[k, :] = term1.sum(axis=1) + term2.sum(axis=1)
+        log_pi = np.log(self.pi_ + 1e-12)[:, None]
+        log_joint = log_pi + log_likelihoods
+        # log p(X)
+        max_log = np.max(log_joint, axis=0)
+        sum_exp = np.exp(log_joint - max_log).sum(axis=0)
+        log_px = max_log + np.log(sum_exp + 1e-12)
+        return log_px.mean()
+
+
+# ------------------ EJEMPLO DE USO ------------------
+if __name__ == "__main__":
+    # Simular datos: 3 clases, 8 items binarios
+    rng = np.random.RandomState(123)
+    n = 1000
+    J = 8
+    K_true = 3
+
+    # parámetros verdaderos simulados
+    pi_true = np.array([0.4, 0.35, 0.25])
+    theta_true = np.array([
+        [0.8, 0.7, 0.1, 0.15, 0.2, 0.9, 0.85, 0.1],
+        [0.2, 0.25, 0.7, 0.6, 0.65, 0.1, 0.15, 0.7],
+        [0.5, 0.45, 0.4, 0.35, 0.3, 0.5, 0.45, 0.4]
+    ])
+
+    # asignar clases
+    z = rng.choice(K_true, size=n, p=pi_true)
+    X = np.zeros((n, J), dtype=int)
+    for i in range(n):
+        k = z[i]
+        X[i] = rng.binomial(1, theta_true[k])
+
+    # ajustar varios K y comparar BIC
+    results = []
+    for K in [1, 2, 3, 4, 5]:
+        model = BinaryLCA(n_components=K, max_iter=500, tol=1e-6, random_state=42, verbose=False)
+        model.fit(X)
+        bic = model.bic(X)
+        aic = model.aic(X)
+        ll = model.log_likelihood_[-1]
+        results.append((K, bic, aic, ll))
+
+    df = pd.DataFrame(results, columns=['K', 'BIC', 'AIC', 'LogLik'])
+    print(df)
+
+    # ajustar el K seleccionado y mostrar theta
+    bestK = df.sort_values('BIC').iloc[0]['K']
+    print(f"Mejor K por BIC: {int(bestK)}")
+    model = BinaryLCA(n_components=int(bestK), random_state=0, verbose=True)
+    model.fit(X)
+    print("Pesos pi:", model.pi_)
+    print("Theta (probabilidades por ítem por clase):")
+    print(model.theta_)
+
+    # ejemplo de predict_proba
+    post = model.predict_proba(X[:5])
+    print("Posteriores primeras 5 muestras:\n", post)
