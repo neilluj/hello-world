@@ -1,0 +1,93 @@
+import os
+import glob
+import pandas as pd
+import numpy as np
+from stepmix.stepmix import StepMix
+
+# -------- CONFIG --------
+ruta_carpeta = "ruta/a/tu/carpeta"
+n_clases = 5
+
+# -------- OBJETOS RESULTADO --------
+lista_df_etiquetados = []
+lista_min_max = []
+
+# -------- IDENTIFICAR MESES --------
+archivos = glob.glob(os.path.join(ruta_carpeta, "*.csv"))
+
+# Extraer meses únicos
+meses = sorted(list(set([
+    os.path.basename(f).split("_")[1]  # asume formato 2025_01_a.csv
+    for f in archivos
+])))
+
+for mes in meses:
+    
+    print(f"Procesando mes {mes}...")
+    
+    # Leer parte A y B
+    archivo_a = glob.glob(os.path.join(ruta_carpeta, f"2025_{mes}_a.csv"))[0]
+    archivo_b = glob.glob(os.path.join(ruta_carpeta, f"2025_{mes}_b.csv"))[0]
+    
+    df_a = pd.read_csv(archivo_a)
+    df_b = pd.read_csv(archivo_b)
+    
+    # Concatenar
+    df = pd.concat([df_a, df_b], axis=0, ignore_index=True)
+    
+    # -------- STEP MIX --------
+    modelo = StepMix(
+        n_components=n_clases,
+        measurement="continuous",
+        random_state=123
+    )
+    
+    X = df[["IND_LABEL"]].values
+    modelo.fit(X)
+    
+    # Clases originales
+    clases_originales = modelo.predict(X)
+    
+    # Promedio por clase
+    df_temp = pd.DataFrame({
+        "clase_original": clases_originales,
+        "IND_LABEL": df["IND_LABEL"].values
+    })
+    
+    promedio_clase = (
+        df_temp
+        .groupby("clase_original")["IND_LABEL"]
+        .mean()
+        .sort_values()
+    )
+    
+    # Mapeo ordenado 0-4
+    mapping = {
+        clase_original: nueva_clase
+        for nueva_clase, clase_original in enumerate(promedio_clase.index)
+    }
+    
+    # Aplicar orden
+    df["clase_ordenada"] = pd.Series(clases_originales).map(mapping)
+    df["mes"] = mes
+    
+    # Guardar etiquetado
+    lista_df_etiquetados.append(df.copy())
+    
+    # -------- MIN MAX IND_DIGITAL --------
+    resumen_mes = (
+        df.groupby("clase_ordenada")["IND_DIGITAL"]
+        .agg(["min", "max"])
+        .reset_index()
+    )
+    
+    resumen_mes["mes"] = mes
+    
+    lista_min_max.append(resumen_mes)
+
+# -------- CONCATENAR RESULTADOS --------
+df_etiquetado = pd.concat(lista_df_etiquetados, ignore_index=True)
+
+df_min_max_mensual = pd.concat(lista_min_max, ignore_index=True)
+
+print("Proceso terminado.")
